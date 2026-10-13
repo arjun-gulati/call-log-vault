@@ -1,0 +1,31 @@
+# FAQ
+
+**Does Samsung really delete call logs after 2000 entries?**
+Yes. The system call log is capped, and on Galaxy phones the practical limit people hit is the newest 2000 entries. As new calls arrive, the oldest are removed automatically. There is no built-in setting to raise or disable the cap.
+
+**Is this only for Samsung phones?**
+No, the app runs on any Android 8.0+ phone. Samsung users just feel the problem the most, because of the 2000 cap.
+
+**Does it need root?**
+No. No root, no ADB tricks, no special modes. It uses only normal Android permissions.
+
+**Does it send my calls anywhere?**
+No, and it cannot. The app has no internet permission, which you can verify yourself in Android settings. Everything stays on your phone, and backups go only to the folder you pick.
+
+**What about battery?**
+The app does not poll and does not run a background service. Android wakes it briefly when your call log changes, it copies what is new, and it sleeps again. In battery settings you should see it at or near zero.
+
+**What happens when the phone's own log passes 2000 after I restore everything?**
+The phone dialer trims the oldest again, that is system behaviour. The vault keeps the complete history regardless, and you can restore again anytime.
+
+**I cleared the app data / uninstalled by mistake. Is my history gone?**
+If you set an auto backup folder, no. Restore from `call-log-vault-auto.zip` in that folder and everything comes back. This is exactly why the backup lives outside the app.
+
+**What format are backups in?**
+A plain ZIP with calls.csv (open it in any spreadsheet), calls.json (full data), calls.xml (the format also used by SMS Backup and Restore), and a README. Restoring Call Log Vault's own ZIP is fully supported. Other apps reading the XML is a bonus, not a guarantee.
+
+**Will this come to the Play Store?**
+Maybe, one day. For now GitHub Releases is the home. Same APK, same signature, every time. If a file claiming to be Call Log Vault has a different SHA-256 than the one published here, it is not this app.
+
+**How many calls can the vault hold?**
+There is no cap in the app. It grows with your history.

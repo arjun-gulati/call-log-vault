@@ -1,0 +1,53 @@
+# Call Log Vault
+
+**Your phone is silently deleting your call history. This app stops that.**
+
+Samsung Galaxy phones keep only the newest **2000 entries** in the call log. Every new call quietly deletes the oldest one. No warning, no setting to turn it off. One day you need a number from a few months ago and it is simply gone.
+
+Call Log Vault fixes that one problem. It quietly copies every call into its own vault on your phone, before the limit eats it. The vault has **no limit** and never deletes anything.
+
+Vibe coded by Arjun to solve his own problem, on his own S24 Ultra.
+
+## The short version
+
+- Copies every incoming, outgoing and missed call into a private on-device vault
+- **No internet permission at all.** Not a promise, the permission does not exist in the app. Check it yourself: Settings, Apps, Call Log Vault, Permissions
+- **No ads, no root, no account, no trackers, no data theft.** Fully offline, forever
+- Wakes up only when your call log actually changes, so battery use is effectively zero
+- Auto backup to a folder **you** pick, outside the app, so clearing app data or uninstalling can never delete your backup
+- Restore your full history back into the normal phone call log anytime, it shows up in any dialer app
+- Search your entire history by name or number, filter by call type, see per-person timelines
+- Light, Dark and true black AMOLED themes
+
+## Why trust it
+
+- The app requests exactly 4 permissions: read call log, write call log (for restore), read contacts (to show names), and receive boot completed (so it restarts after a reboot). Nothing else. There is no internet permission to abuse
+- Every backup is a plain ZIP containing CSV, JSON and XML files. Your data is readable by normal tools, never locked into a weird format
+- Verify the download yourself. SHA-256 of the v1.0.6 APK:
+  `dc4de49f69631ed05d52a7a80992690781959cd64cfe3791faa45536fee22918`
+
+## Install
+
+1. Download the APK from the [Releases](../../releases) page
+2. Open it and allow the install when Android asks
+3. Open Call Log Vault and grant the call log permission. Your current call log is imported right away
+4. Optional but recommended: open the drawer, tap Auto backup folder, and pick any folder you like. Your rolling backup will live there, outside the app
+
+Step by step with more detail: [INSTALL.md](INSTALL.md)
+Questions: [FAQ.md](FAQ.md)
+
+## How it works
+
+Android lets apps ask to be woken when the call log changes. Call Log Vault registers for exactly that, copies any new calls into its own database, and goes back to sleep. No polling, no background service sitting awake, no wakelocks. A once-a-day safety sync catches anything that might have slipped through.
+
+Your phone's own call log will still trim at 2000, that behaviour is built into the system and cannot be changed without root. The difference is that now it no longer matters, because the vault keeps everything, and one tap restores as much as you want back into the dialer.
+
+## Restoring
+
+Restoring writes the vault's records back into the Android call log provider, skipping duplicates. Any dialer (Samsung Phone, Google Phone, others) then shows them like normal calls. If you restore more than 2000, the phone dialer will trim the oldest again over time, but the vault always keeps the complete history.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
+
+Imagined by Arjun.
