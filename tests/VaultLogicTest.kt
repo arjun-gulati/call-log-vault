@@ -43,6 +43,8 @@ fun main() {
     testAutoBackupWriteDecision()
     testFolderNames()
     testAppearanceResolution()
+    testAppearanceAuto()
+    testBackupSchedules()
     testFormatterConsistency()
     testRowDisplayStrings()
     testEllipsize()
@@ -243,21 +245,7 @@ fun testAutoBackupThrottle() {
 }
 
 fun testAutoBackupWriteDecision() {
-    println("== auto backup write decision (v1.0.4) ==")
-    val now = 1700100000000L
-    val min = VaultLogic.AUTO_BACKUP_MIN_INTERVAL_MS
-    check("forced run writes even with nothing new",
-        VaultLogic.shouldAttemptAutoWrite(true, now - 1000, 0, now))
-    check("forced run writes even when never written",
-        VaultLogic.shouldAttemptAutoWrite(true, 0, 0, now))
-    check("unforced run follows throttle: nothing new waits",
-        !VaultLogic.shouldAttemptAutoWrite(false, now - 60 * min, 0, now))
-    check("unforced run follows throttle: recent write waits",
-        !VaultLogic.shouldAttemptAutoWrite(false, now - min / 2, 3, now))
-    check("unforced run follows throttle: interval passed writes",
-        VaultLogic.shouldAttemptAutoWrite(false, now - min - 1, 1, now))
-    check("unforced run follows throttle: burst writes",
-        VaultLogic.shouldAttemptAutoWrite(false, now - 60_000, 20, now))
+    println("== auto backup scheduling gate ==")
     check("no schedule when a sync added nothing", !VaultLogic.shouldScheduleAutoBackup(0))
     check("schedule when a sync added one call", VaultLogic.shouldScheduleAutoBackup(1))
     check("schedule when a sync added many calls", VaultLogic.shouldScheduleAutoBackup(250))
@@ -292,6 +280,91 @@ fun testAppearanceResolution() {
     check("preset names", VaultLogic.appearanceName(light) == "Light" &&
         VaultLogic.appearanceName(dark) == "Dark" &&
         VaultLogic.appearanceName(amoled) == "AMOLED")
+}
+
+fun testAppearanceAuto() {
+    println("== appearance Auto resolution (v1.0.8) ==")
+    val light = VaultLogic.APPEARANCE_LIGHT
+    val dark = VaultLogic.APPEARANCE_DARK
+    val amoled = VaultLogic.APPEARANCE_AMOLED
+    val auto = VaultLogic.APPEARANCE_AUTO
+    // Stored v2 value: Auto round trips like the concrete presets.
+    check("v2 Auto round trips", VaultLogic.resolveAppearance(true, auto, false, 0) == auto)
+    check("Auto has a name", VaultLogic.appearanceName(auto) == "Auto")
+    // Explicit modes resolve to themselves, day and night alike.
+    check("explicit Light in day", VaultLogic.resolveAppearance(light, amoled, false) == light)
+    check("explicit Light in night", VaultLogic.resolveAppearance(light, amoled, true) == light)
+    check("explicit Dark in day", VaultLogic.resolveAppearance(dark, amoled, false) == dark)
+    check("explicit Dark in night", VaultLogic.resolveAppearance(dark, light, true) == dark)
+    check("explicit AMOLED in day", VaultLogic.resolveAppearance(amoled, dark, false) == amoled)
+    check("explicit AMOLED in night", VaultLogic.resolveAppearance(amoled, dark, true) == amoled)
+    // Auto follows the system, with the stored flavour at night.
+    check("Auto in day is Light (AMOLED flavour)",
+        VaultLogic.resolveAppearance(auto, amoled, false) == light)
+    check("Auto in day is Light (Dark flavour)",
+        VaultLogic.resolveAppearance(auto, dark, false) == light)
+    check("Auto at night with AMOLED flavour",
+        VaultLogic.resolveAppearance(auto, amoled, true) == amoled)
+    check("Auto at night with Dark flavour",
+        VaultLogic.resolveAppearance(auto, dark, true) == dark)
+    // A flavour that is not a dark preset counts as AMOLED.
+    check("Auto at night with Light flavour falls back to AMOLED",
+        VaultLogic.resolveAppearance(auto, light, true) == amoled)
+    check("Auto at night with Auto flavour falls back to AMOLED",
+        VaultLogic.resolveAppearance(auto, auto, true) == amoled)
+    check("Auto at night with garbage flavour falls back to AMOLED",
+        VaultLogic.resolveAppearance(auto, 99, true) == amoled)
+    // Unknown modes keep the standing AMOLED fallback.
+    check("unknown mode falls back to AMOLED",
+        VaultLogic.resolveAppearance(42, dark, false) == amoled)
+}
+
+fun testBackupSchedules() {
+    println("== backup schedules (v1.0.8) ==")
+    val now = 1700100000000L
+    val smart = VaultLogic.BACKUP_SCHEDULE_SMART
+    val everyCall = VaultLogic.BACKUP_SCHEDULE_EVERY_CALL
+    val every6h = VaultLogic.BACKUP_SCHEDULE_EVERY_6H
+    val daily = VaultLogic.BACKUP_SCHEDULE_DAILY
+    val min = VaultLogic.AUTO_BACKUP_MIN_INTERVAL_MS
+    val h6 = VaultLogic.BACKUP_6H_INTERVAL_MS
+    val day = VaultLogic.BACKUP_DAY_INTERVAL_MS
+    check("schedule names",
+        VaultLogic.backupScheduleName(smart) == "Smart" &&
+            VaultLogic.backupScheduleName(everyCall) == "After every call" &&
+            VaultLogic.backupScheduleName(every6h) == "Every 6 hours" &&
+            VaultLogic.backupScheduleName(daily) == "Daily" &&
+            VaultLogic.backupScheduleName(99) == "Smart")
+    // Smart is exactly the old throttle.
+    check("Smart: nothing new never writes", !VaultLogic.shouldWriteBackup(smart, now - 60 * min, 0, now))
+    check("Smart: first write with one new call", VaultLogic.shouldWriteBackup(smart, 0, 1, now))
+    check("Smart: recent write with few new calls waits", !VaultLogic.shouldWriteBackup(smart, now - min / 2, 3, now))
+    check("Smart: write after 15 minutes", VaultLogic.shouldWriteBackup(smart, now - min - 1, 1, now))
+    check("Smart: burst of 20 writes right away", VaultLogic.shouldWriteBackup(smart, now - 60_000, 20, now))
+    // After every call: any new call writes, interval does not matter.
+    check("Every call: one new call a minute after a write",
+        VaultLogic.shouldWriteBackup(everyCall, now - 60_000, 1, now))
+    check("Every call: several new calls write", VaultLogic.shouldWriteBackup(everyCall, now - 1000, 5, now))
+    check("Every call: first write", VaultLogic.shouldWriteBackup(everyCall, 0, 1, now))
+    check("Every call: nothing new does not write", !VaultLogic.shouldWriteBackup(everyCall, now - 60_000, 0, now))
+    check("Every call: nothing new and never written does not write", !VaultLogic.shouldWriteBackup(everyCall, 0, 0, now))
+    // Every 6 hours: interval gate, exact boundary included.
+    check("6h: first write with one new call", VaultLogic.shouldWriteBackup(every6h, 0, 1, now))
+    check("6h: inside the interval waits", !VaultLogic.shouldWriteBackup(every6h, now - h6 / 2, 1, now))
+    check("6h: one ms before the interval still waits", !VaultLogic.shouldWriteBackup(every6h, now - h6 + 1, 3, now))
+    check("6h: exactly at the interval writes", VaultLogic.shouldWriteBackup(every6h, now - h6, 1, now))
+    check("6h: past the interval writes", VaultLogic.shouldWriteBackup(every6h, now - h6 - 1, 1, now))
+    check("6h: nothing new never writes even past the interval", !VaultLogic.shouldWriteBackup(every6h, now - 2 * h6, 0, now))
+    // Daily: same shape at 24 hours.
+    check("Daily: first write with one new call", VaultLogic.shouldWriteBackup(daily, 0, 1, now))
+    check("Daily: at 6 hours still waits", !VaultLogic.shouldWriteBackup(daily, now - h6, 1, now))
+    check("Daily: one ms before 24h still waits", !VaultLogic.shouldWriteBackup(daily, now - day + 1, 2, now))
+    check("Daily: exactly at 24h writes", VaultLogic.shouldWriteBackup(daily, now - day, 1, now))
+    check("Daily: past 24h writes", VaultLogic.shouldWriteBackup(daily, now - day - 1, 1, now))
+    check("Daily: nothing new never writes", !VaultLogic.shouldWriteBackup(daily, now - 2 * day, 0, now))
+    // Unknown schedule values behave as Smart.
+    check("unknown schedule waits like Smart", !VaultLogic.shouldWriteBackup(99, now - min / 2, 3, now))
+    check("unknown schedule bursts like Smart", VaultLogic.shouldWriteBackup(99, now - 60_000, 20, now))
 }
 
 fun testFormatterConsistency() {
