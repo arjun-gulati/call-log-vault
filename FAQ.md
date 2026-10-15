@@ -36,5 +36,8 @@ Yes. In the drawer, set the theme to Auto. The app is light when your phone is i
 **Can I delete entries from the vault?**
 Yes, manually. Open a person's timeline, long press an entry to delete just that one, or use the delete all option on that screen to clear the whole number. Both ask for confirmation first and cannot be undone. The app itself never deletes anything automatically, deleting is only ever something you do on purpose. Deleting from the vault does not delete anything from your phone's own call log.
 
+**Can two of my phones share one call history?**
+Yes. Install the app on both, pick the same auto backup folder on both (a folder your own sync tool keeps in step between the phones, for example Syncthing or Dropsync), and turn on Watch backup folder on both. Each phone imports new records that arrive in the folder, merges them into its vault without duplicates, and writes the merged history back. Imports only add records; a deletion on one phone never deletes anything on the other. There is no server and no account: the app has no internet permission, your folder and your sync tool do all the carrying. Checks happen when the app wakes for other work, like a backup run or opening the app, so a call made on one phone typically shows up on the other within minutes rather than instantly.
+
 **How often does the auto backup run?**
 You choose, in the drawer's Backup schedule setting: Smart (a new backup after a burst of calls, and at most once every 15 minutes otherwise), After every call, Every 6 hours, or Daily.

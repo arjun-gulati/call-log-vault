@@ -15,6 +15,8 @@ Vibe coded by Arjun to solve his own problem, on his own S24 Ultra.
 - **No ads, no root, no account, no trackers, no data theft.** Fully offline, forever
 - Wakes up only when your call log actually changes, so battery use is effectively zero
 - Auto backup to a folder **you** pick, outside the app, so clearing app data or uninstalling can never delete your backup. You choose how often: after every call, every 6 hours, daily, or smart
+
+- Two devices, one history: turn on Watch backup folder and the app imports new backups that appear in your backup folder, merges them without duplicates, and can optionally restore imported calls into your dialer. Your own folder sync tool does the carrying between devices, there is no server and no account
 - Restore your full history back into the normal phone call log anytime, it shows up in any dialer app
 - Search your entire history by name or number, filter by call type, see per-person timelines
 - Light, Dark and Auto themes (Auto follows your phone's own light and dark mode), with a switch to make Dark true black AMOLED
@@ -25,8 +27,8 @@ Vibe coded by Arjun to solve his own problem, on his own S24 Ultra.
 
 - The app requests exactly 4 permissions: read call log, write call log (for restore), read contacts (to show names), and receive boot completed (so it restarts after a reboot). Nothing else. There is no internet permission to abuse
 - Every backup is a plain ZIP containing CSV, JSON and XML files. Your data is readable by normal tools, never locked into a weird format
-- Verify the download yourself. SHA-256 of the v1.0.9 APK:
-  `9537f84a1cad154aa709d7b0174a86f4859074997f781bed91eece77563a06e0`
+- Verify the download yourself. SHA-256 of the v1.1.0 APK:
+  `b6d94d90f331c1e42a5989a4f51b5047084a7e5a1199dafcf343fdd7f426e32a`
 - The full source code is in this repo (see below). Do not take anyone's word for what the app does, read it
 
 ## Install
