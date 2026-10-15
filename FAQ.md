@@ -31,7 +31,7 @@ Maybe, one day. For now GitHub Releases is the home. Same APK, same signature, e
 There is no cap in the app. It grows with your history.
 
 **Can the app follow my phone's dark mode?**
-Yes. In the drawer, set the theme to Auto. The app is light when your phone is in light mode, and switches to your dark flavour (Dark or AMOLED, whichever you picked last) when the phone goes dark.
+Yes. In the drawer, set the theme to Auto. The app is light when your phone is in light mode and dark when the phone goes dark. A separate switch in the drawer, Use AMOLED for Dark, decides whether dark means the normal dark theme or true black AMOLED, for both the Dark theme and Auto's dark side.
 
 **Can I delete entries from the vault?**
 Yes, manually. Open a person's timeline, long press an entry to delete just that one, or use the delete all option on that screen to clear the whole number. Both ask for confirmation first and cannot be undone. The app itself never deletes anything automatically, deleting is only ever something you do on purpose. Deleting from the vault does not delete anything from your phone's own call log.

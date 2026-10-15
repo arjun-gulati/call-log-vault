@@ -17,7 +17,7 @@ Vibe coded by Arjun to solve his own problem, on his own S24 Ultra.
 - Auto backup to a folder **you** pick, outside the app, so clearing app data or uninstalling can never delete your backup. You choose how often: after every call, every 6 hours, daily, or smart
 - Restore your full history back into the normal phone call log anytime, it shows up in any dialer app
 - Search your entire history by name or number, filter by call type, see per-person timelines
-- Light, Dark and true black AMOLED themes, or Auto to follow your phone's own light and dark mode
+- Light, Dark and Auto themes (Auto follows your phone's own light and dark mode), with a switch to make Dark true black AMOLED
 
 - Manual delete when you want it: long press an entry in a person's timeline to remove it, or clear a whole number. The vault never deletes anything by itself, deleting is only ever your own tap
 
@@ -25,8 +25,8 @@ Vibe coded by Arjun to solve his own problem, on his own S24 Ultra.
 
 - The app requests exactly 4 permissions: read call log, write call log (for restore), read contacts (to show names), and receive boot completed (so it restarts after a reboot). Nothing else. There is no internet permission to abuse
 - Every backup is a plain ZIP containing CSV, JSON and XML files. Your data is readable by normal tools, never locked into a weird format
-- Verify the download yourself. SHA-256 of the v1.0.8 APK:
-  `d26aea137711761f21ac8204db46489fd4f58b6f7e8fb9809f2c4f118a25e3c1`
+- Verify the download yourself. SHA-256 of the v1.0.9 APK:
+  `9537f84a1cad154aa709d7b0174a86f4859074997f781bed91eece77563a06e0`
 - The full source code is in this repo (see below). Do not take anyone's word for what the app does, read it
 
 ## Install
