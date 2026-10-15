@@ -32,6 +32,7 @@ fun main() {
     testDedupe()
     testXml()
     testCsv()
+    testParseCsv()
     testJson()
     testDates()
     testFilters()
@@ -45,6 +46,7 @@ fun main() {
     testAppearanceMigration()
     testAppearanceResolution()
     testBackupSchedules()
+    testWatchFolder()
     testFormatterConsistency()
     testRowDisplayStrings()
     testEllipsize()
@@ -130,6 +132,35 @@ fun testCsv() {
     check("header row", lines[0] == "number,name,date_ms,date,type,type_label,duration_sec,subscription_id")
     check("comma name quoted in row", lines[1].contains("\"Doe, John\""))
     check("type label in row", lines[1].contains("Incoming"))
+}
+
+fun testParseCsv() {
+    println("== CSV parse (watch folder fallback entry) ==")
+    val tricky = rec(name = "Doe, John \"JD\"", number = "+1 555 0100", sub = "sim,1")
+    val plain = rec(name = "", number = "12345", date = 1700003600000L, type = VaultLogic.TYPE_MISSED, duration = 0)
+    val csv = VaultLogic.generateCsv(listOf(tricky, plain))
+    val parsed = VaultLogic.parseCallsCsv(csv)
+    check("csv round trip count", parsed.size == 2)
+    check("csv round trip quoted name", parsed[0].name == "Doe, John \"JD\"")
+    check("csv round trip number", parsed[0].numberRaw == "+1 555 0100")
+    check("csv round trip normalized", parsed[0].numberNorm == "+15550100")
+    check("csv round trip sub with comma", parsed[0].subscriptionId == "sim,1")
+    check("csv round trip duration and type", parsed[0].durationSec == 65L && parsed[0].type == VaultLogic.TYPE_INCOMING)
+    check("csv round trip unknown name", parsed[1].name == "" && parsed[1].type == VaultLogic.TYPE_MISSED)
+    // The date column carries a comma inside quotes ("14 Nov 2023, 10:13 PM"):
+    // field alignment must survive it, which the round trip above proves.
+    val rows = VaultLogic.parseCsvRows(csv)
+    check("header row detected", VaultLogic.isCsvHeaderRow(rows[0]))
+    check("data row is not a header", !VaultLogic.isCsvHeaderRow(rows[1]))
+    check("quoted comma stays one field", rows[1].size == 8 && rows[1][3].contains(","))
+    check("crlf rows split", VaultLogic.parseCsvRows("a,b\r\nc,d\r\n").size == 2)
+    check("no trailing newline still yields the row", VaultLogic.parseCsvRows("a,b").size == 1)
+    check("empty csv parses empty", VaultLogic.parseCallsCsv("").isEmpty())
+    check("header only csv parses empty",
+        VaultLogic.parseCallsCsv("number,name,date_ms,date,type,type_label,duration_sec,subscription_id\n").isEmpty())
+    check("garbage row skipped", VaultLogic.parseCallsCsv("x,y\n").isEmpty())
+    check("bad date row skipped",
+        VaultLogic.parseCallsCsv("number,name,date_ms,date,type,type_label,duration_sec,subscription_id\n123,A,notadate,x,1,Incoming,5,\n").isEmpty())
 }
 
 fun testJson() {
@@ -391,6 +422,90 @@ fun testBackupSchedules() {
     // Unknown schedule values behave as Smart.
     check("unknown schedule waits like Smart", !VaultLogic.shouldWriteBackup(99, now - min / 2, 3, now))
     check("unknown schedule bursts like Smart", VaultLogic.shouldWriteBackup(99, now - 60_000, 20, now))
+}
+
+fun testWatchFolder() {
+    println("== watch folder (v1.1.0) ==")
+    // Fingerprint: size prefix plus SHA-256 of the entry bytes.
+    val emptyHash = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    check("fingerprint of empty entry is the known empty SHA-256",
+        VaultLogic.zipFingerprint(0L, ByteArray(0)) == "0:$emptyHash")
+    val bytesA = "calls-json-a".toByteArray(Charsets.UTF_8)
+    val bytesB = "calls-json-b".toByteArray(Charsets.UTF_8)
+    check("fingerprint stable for identical bytes",
+        VaultLogic.zipFingerprint(1200L, bytesA) == VaultLogic.zipFingerprint(1200L, bytesA.copyOf()))
+    check("fingerprint differs when bytes differ",
+        VaultLogic.zipFingerprint(1200L, bytesA) != VaultLogic.zipFingerprint(1200L, bytesB))
+    check("fingerprint differs when size differs",
+        VaultLogic.zipFingerprint(1200L, bytesA) != VaultLogic.zipFingerprint(1201L, bytesA))
+    check("fingerprint carries the size prefix",
+        VaultLogic.zipFingerprint(42L, bytesA).startsWith("42:"))
+    // Import decision matrix.
+    val stored = VaultLogic.zipFingerprint(1200L, bytesA)
+    val changed = VaultLogic.zipFingerprint(1300L, bytesB)
+    check("watch off never imports even when changed",
+        !VaultLogic.shouldImportWatched(stored, changed, watchEnabled = false))
+    check("watch off with no stored fingerprint never imports",
+        !VaultLogic.shouldImportWatched("", changed, watchEnabled = false))
+    check("same fingerprint skips", !VaultLogic.shouldImportWatched(stored, stored, watchEnabled = true))
+    check("changed fingerprint imports", VaultLogic.shouldImportWatched(stored, changed, watchEnabled = true))
+    check("absent file skips quietly", !VaultLogic.shouldImportWatched(stored, null, watchEnabled = true))
+    check("absent file and nothing stored skips", !VaultLogic.shouldImportWatched("", null, watchEnabled = true))
+    check("first check with nothing stored imports",
+        VaultLogic.shouldImportWatched("", changed, watchEnabled = true))
+    // Name resolution: the later import wins, but never erases.
+    check("incoming name wins", VaultLogic.mergedImportName("Asha", "Asha Rani") == "Asha Rani")
+    check("incoming fills an empty saved name", VaultLogic.mergedImportName("", "Asha") == "Asha")
+    check("empty incoming never erases", VaultLogic.mergedImportName("Asha", "") == "Asha")
+    check("unknown marker incoming never erases", VaultLogic.mergedImportName("Asha", "(Unknown)") == "Asha")
+    check("both names missing stays missing", VaultLogic.mergedImportName("", "") == "")
+    check("same name resolves to itself", VaultLogic.mergedImportName("Asha", "Asha") == "Asha")
+    // Merge planning: union, dedupe, renames.
+    val mine = rec(name = "Asha", date = 1000)
+    val mineKey = VaultLogic.dedupeKey(mine)
+    val theirs = rec(number = "5550001111", name = "Bala", date = 2000, type = VaultLogic.TYPE_OUTGOING)
+    val theirsKey = VaultLogic.dedupeKey(theirs)
+    val emptyPlan = VaultLogic.planWatchMerge(emptyMap(), emptyList())
+    check("empty merge plans nothing", emptyPlan.inserts.isEmpty() && emptyPlan.nameUpdates.isEmpty())
+    val unionPlan = VaultLogic.planWatchMerge(mapOf(mineKey to "Asha"), listOf(mine, theirs))
+    check("union: the new record inserts", unionPlan.inserts == listOf(theirs))
+    check("union: the shared record is untouched", unionPlan.nameUpdates.isEmpty())
+    val allNewPlan = VaultLogic.planWatchMerge(emptyMap(), listOf(mine, theirs))
+    check("empty vault takes everything as inserts",
+        allNewPlan.inserts == listOf(mine, theirs) && allNewPlan.nameUpdates.isEmpty())
+    val renamed = rec(name = "Asha Rani", date = 1000)
+    val renamePlan = VaultLogic.planWatchMerge(mapOf(mineKey to "Asha"), listOf(renamed))
+    check("conflict: later import name wins as an update",
+        renamePlan.inserts.isEmpty() && renamePlan.nameUpdates == listOf(renamed))
+    val unnamedIncoming = rec(name = "", date = 1000)
+    val keepPlan = VaultLogic.planWatchMerge(mapOf(mineKey to "Asha"), listOf(unnamedIncoming))
+    check("conflict: an unnamed arrival changes nothing",
+        keepPlan.inserts.isEmpty() && keepPlan.nameUpdates.isEmpty())
+    val fillPlan = VaultLogic.planWatchMerge(mapOf(mineKey to ""), listOf(mine))
+    check("conflict: a named arrival fills a missing name",
+        fillPlan.nameUpdates == listOf(mine) && fillPlan.inserts.isEmpty())
+    val dupFirst = rec(name = "First", date = 3000)
+    val dupSecond = rec(name = "Second", date = 3000)
+    val dupPlan = VaultLogic.planWatchMerge(emptyMap(), listOf(dupFirst, dupSecond))
+    check("in-file duplicate inserts once", dupPlan.inserts == listOf(dupFirst))
+    check("in-file duplicate resolves to the later name",
+        dupPlan.nameUpdates == listOf(dupSecond))
+    val source = mutableMapOf(mineKey to "Asha")
+    VaultLogic.planWatchMerge(source, listOf(renamed, theirs))
+    check("the caller's map is never mutated", source == mutableMapOf(mineKey to "Asha"))
+    check("disjoint keys both known", theirsKey != mineKey)
+    // Status text.
+    check("status imported plural",
+        VaultLogic.watchStatusText(VaultLogic.WATCH_RESULT_IMPORTED, 12) ==
+            "Watch folder: 12 new calls imported")
+    check("status imported singular",
+        VaultLogic.watchStatusText(VaultLogic.WATCH_RESULT_IMPORTED, 1) ==
+            "Watch folder: 1 new call imported")
+    check("status up to date",
+        VaultLogic.watchStatusText(VaultLogic.WATCH_RESULT_UP_TO_DATE, 0) == "Watch folder: up to date")
+    check("status unreadable",
+        VaultLogic.watchStatusText(VaultLogic.WATCH_RESULT_UNREADABLE, 0) ==
+            "Watch folder: a changed backup could not be read")
 }
 
 fun testFormatterConsistency() {
