@@ -89,6 +89,9 @@ class MainActivity : Activity() {
     private lateinit var statAuto: TextView
     private var autoSubtitle: TextView? = null
     private var scheduleSubtitle: TextView? = null
+    private var watchSwitch: Switch? = null
+    private var autoRestoreSwitch: Switch? = null
+    private var autoRestoreRowView: LinearLayout? = null
 
     private var allRecords: List<VaultLogic.CallRecord> = emptyList()
     private var people: List<VaultLogic.PersonSummary> = emptyList()
@@ -568,6 +571,8 @@ class MainActivity : Activity() {
         }
         scheduleSubtitle = scheduleRow.second
         body.addView(scheduleRow.first)
+        body.addView(watchSwitchRow())
+        body.addView(autoRestoreSwitchRow())
 
         body.addView(eyebrow("APP"))
         body.addView(drawerRow(R.drawable.ic_nav_sync, "Sync now", null) {
@@ -593,6 +598,7 @@ class MainActivity : Activity() {
         frame.addView(panel)
         updateAutoRow()
         updateScheduleRow()
+        updateWatchRows()
     }
 
     /**
@@ -707,6 +713,122 @@ class MainActivity : Activity() {
         row.addView(toggle)
         row.setOnClickListener { toggle.isChecked = !toggle.isChecked }
         return row
+    }
+
+    /**
+     * A drawer switch row in the same shape as the AMOLED switch:
+     * icon tile, a title with a short subtitle under it, and a
+     * framework Switch at the end. Tapping the row flips the
+     * switch, like the AMOLED row. The checked state is set before
+     * the listener is attached, so building the row never fires it.
+     */
+    private fun switchRow(
+        icon: Int,
+        title: String,
+        subtitle: String,
+        checked: Boolean,
+        onFlip: (Boolean) -> Unit
+    ): Pair<LinearLayout, Switch> {
+        val toggle = Switch(this)
+        val row = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            minimumHeight = dp(56)
+            setPadding(dp(16), dp(8), dp(16), dp(8))
+            isClickable = true
+            isFocusable = true
+            pressFeedback()
+        }
+        row.addView(ImageView(this).apply {
+            layoutParams = LinearLayout.LayoutParams(dp(40), dp(40))
+            setBackgroundResource(R.drawable.tile_squircle)
+            setImageResource(icon)
+            setColorFilter(color(R.color.tile_icon))
+            scaleType = ImageView.ScaleType.CENTER
+            setPadding(dp(9), dp(9), dp(9), dp(9))
+        })
+        row.addView(LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER_VERTICAL
+            layoutParams = LinearLayout.LayoutParams(
+                0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f
+            ).apply { marginStart = dp(16) }
+            addView(TextView(this@MainActivity).apply {
+                text = title
+                textSize = 16f
+                setTextColor(color(R.color.text))
+            })
+            addView(TextView(this@MainActivity).apply {
+                text = subtitle
+                textSize = 12f
+                setTextColor(color(R.color.muted))
+            })
+        })
+        toggle.isChecked = checked
+        toggle.setOnCheckedChangeListener { _, isChecked -> onFlip(isChecked) }
+        row.addView(toggle)
+        row.setOnClickListener { toggle.isChecked = !toggle.isChecked }
+        return row to toggle
+    }
+
+    /**
+     * The watch folder switch (v1.1.0), directly under the backup
+     * schedule row. Off is the default and means the app behaves
+     * exactly as before: the check is inert. Turning it on runs a
+     * check straight away through the normal refresh, which is
+     * where every later check rides along too.
+     */
+    private fun watchSwitchRow(): LinearLayout {
+        val (row, toggle) = switchRow(
+            R.drawable.ic_nav_folder,
+            "Watch backup folder",
+            "Import new backups that appear in your backup folder",
+            WatchFolder.watchEnabled(this)
+        ) { checked ->
+            if (WatchFolder.watchEnabled(this@MainActivity) != checked) {
+                WatchFolder.setWatchEnabled(this@MainActivity, checked)
+                updateWatchRows()
+                if (checked) refresh(silent = true)
+            }
+        }
+        watchSwitch = toggle
+        return row
+    }
+
+    /**
+     * The auto restore switch, directly under the watch switch.
+     * Importing into the vault is quiet; writing into the phone
+     * call log is not, so it is its own opt in, default off. The
+     * row only works while watching is on and a backup folder is
+     * set, and it dims to say so (see updateWatchRows); the saved
+     * choice itself is never erased by dimming.
+     */
+    private fun autoRestoreSwitchRow(): LinearLayout {
+        val (row, toggle) = switchRow(
+            R.drawable.ic_nav_restore,
+            "Restore imported calls to phone log",
+            "New calls imported from the folder also appear in your dialer",
+            WatchFolder.autoRestore(this)
+        ) { checked ->
+            if (WatchFolder.autoRestore(this@MainActivity) != checked) {
+                WatchFolder.setAutoRestore(this@MainActivity, checked)
+            }
+        }
+        autoRestoreSwitch = toggle
+        autoRestoreRowView = row
+        row.setOnClickListener {
+            if (WatchFolder.watchEnabled(this@MainActivity) && AutoBackup.hasFolder(this@MainActivity)) {
+                toggle.isChecked = !toggle.isChecked
+            }
+        }
+        return row
+    }
+
+    /** Dim and disable the auto restore row unless it can actually act. */
+    private fun updateWatchRows() {
+        val canRestore = WatchFolder.watchEnabled(this) && AutoBackup.hasFolder(this)
+        autoRestoreRowView?.alpha = if (canRestore) 1f else 0.45f
+        autoRestoreSwitch?.isEnabled = canRestore
     }
 
     private fun drawerHeader(): LinearLayout = LinearLayout(this).apply {
@@ -927,6 +1049,7 @@ class MainActivity : Activity() {
         drawerOpen = true
         updateAutoRow()
         updateScheduleRow()
+        updateWatchRows()
         scrim.visibility = View.VISIBLE
         scrim.alpha = 0f
         try {
@@ -1175,9 +1298,22 @@ class MainActivity : Activity() {
                     AutoBackup.addNewSince(this, result.added)
                     AutoBackupScheduler.schedule(this)
                 }
+                // Watch check (v1.1.0): this refresh is the app open
+                // wakeup the watch rides on, and every manual import
+                // and restore ends in a refresh too, so those checks
+                // come free here. Inert unless the watch switch is
+                // on. An import that changed the vault asks the
+                // auto backup job to write the merged vault back.
+                val watch = WatchFolder.importFromFolderIfChanged(this)
+                if (watch.changed) {
+                    AutoBackup.requestImmediateWrite(this)
+                    AutoBackupScheduler.schedule(this)
+                }
                 val newCount = helper.count(db)
                 if (!VaultLogic.shouldApplyRebuild(
-                        snapshotCount, newCount, result.added, allRecords.isNotEmpty()
+                        snapshotCount, newCount,
+                        result.added + watch.added + watch.namesUpdated,
+                        allRecords.isNotEmpty()
                     )
                 ) {
                     // No-change skip (v1.0.6): the sync added nothing
@@ -1535,6 +1671,7 @@ class MainActivity : Activity() {
                 }
                 AutoBackup.setFolder(this, uri.toString())
                 updateAutoRow()
+                updateWatchRows()
                 if (::statAuto.isInitialized) statAuto.text = autoBackupStatText()
                 toast("Auto backup folder set: " + AutoBackup.folderDisplayName(this))
                 // The first write runs as a scheduled auto backup job,
@@ -1688,6 +1825,10 @@ class MainActivity : Activity() {
                 .append(if (ms > 0) VaultLogic.formatDateTime(ms) else "not yet")
                 .append('\n')
             if (AutoBackup.hasError(this)) sb.append("Auto backup status: needs attention\n")
+        }
+        if (WatchFolder.watchEnabled(this)) {
+            sb.append(WatchFolder.statusLine(this) ?: "Watch folder: not checked yet")
+                .append('\n')
         }
         val appearanceMode = UiKit.appearance(this)
         val appearanceText = if (appearanceMode == UiKit.APPEARANCE_AUTO) {

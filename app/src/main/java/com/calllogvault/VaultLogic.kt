@@ -1,5 +1,6 @@
 package com.calllogvault
 
+import java.security.MessageDigest
 import java.text.SimpleDateFormat
 import java.util.Calendar
 import java.util.Date
@@ -296,6 +297,112 @@ object VaultLogic {
                 lastWriteMs <= 0L || nowMs - lastWriteMs >= BACKUP_DAY_INTERVAL_MS
             else -> shouldWriteAutoBackup(lastWriteMs, newCallsSinceWrite, nowMs)
         }
+    }
+
+    // --------------------------------------- Watch folder (v1.1.0)
+
+    /** Watch check outcomes, stored for the Status line. */
+    const val WATCH_RESULT_IMPORTED = 1
+    const val WATCH_RESULT_UP_TO_DATE = 2
+    const val WATCH_RESULT_UNREADABLE = 3
+
+    /**
+     * Fingerprint of the rolling backup file in the watched folder:
+     * the file size plus the SHA-256 of the backup entry the import
+     * would read (calls.json when present, else the fallback entry).
+     * Two reads of an unchanged file always produce the same
+     * fingerprint; any rewrite, by this device or another, changes
+     * it. Kept as one opaque string so the comparison stays trivial.
+     */
+    fun zipFingerprint(fileSize: Long, entryBytes: ByteArray): String {
+        val digest = MessageDigest.getInstance("SHA-256").digest(entryBytes)
+        val hex = StringBuilder(digest.size * 2)
+        for (b in digest) {
+            val v = b.toInt() and 0xFF
+            hex.append("0123456789abcdef"[v shr 4])
+            hex.append("0123456789abcdef"[v and 0x0F])
+        }
+        return fileSize.toString() + ":" + hex.toString()
+    }
+
+    /**
+     * The watch decision. Watching off never imports. No file in
+     * the folder (a null current fingerprint) never imports, it
+     * skips quietly. A current fingerprint equal to the stored one
+     * means the file is unchanged, or it is this device's own last
+     * write (own writes store their fingerprint too), so it skips.
+     * Anything else imports.
+     */
+    fun shouldImportWatched(
+        fingerprintStored: String,
+        fingerprintCurrent: String?,
+        watchEnabled: Boolean
+    ): Boolean {
+        if (!watchEnabled) return false
+        if (fingerprintCurrent == null) return false
+        return fingerprintCurrent != fingerprintStored
+    }
+
+    /**
+     * Name resolution for a watched import when the same call (same
+     * dedupe key) already sits in the vault with a saved name: the
+     * later import's saved name wins, because each device saves the
+     * name as it was shown on that device. One guard: a missing
+     * incoming name (unknown on the other device) never erases a
+     * name this device already saved.
+     */
+    fun mergedImportName(existingName: String, incomingName: String): String {
+        val incoming = incomingName.trim()
+        if (isUnknownName(incoming)) return existingName
+        return incoming
+    }
+
+    /** What one watched import should do: rows to insert, rows whose saved name changes. */
+    data class MergePlan(val inserts: List<CallRecord>, val nameUpdates: List<CallRecord>)
+
+    /**
+     * Plan a watched import merge against the vault's current
+     * key to saved name map. Pure, so the whole merge semantics are
+     * testable: the result is always the union of both sets
+     * (imports only ever add, deletions never travel), records
+     * whose key is new are inserts, and a record whose key exists
+     * with a different name becomes a name update carrying the
+     * winning name from [mergedImportName]. Duplicates inside the
+     * incoming list itself resolve the same way, in file order:
+     * the first occurrence inserts, a later one may rename it.
+     * The caller's map is never mutated.
+     */
+    fun planWatchMerge(
+        existingNames: Map<String, String>,
+        incoming: List<CallRecord>
+    ): MergePlan {
+        val working = HashMap(existingNames)
+        val inserts = ArrayList<CallRecord>()
+        val updates = ArrayList<CallRecord>()
+        for (r in incoming) {
+            val key = dedupeKey(r)
+            val current = working[key]
+            if (current == null) {
+                inserts.add(r)
+                working[key] = r.name
+            } else {
+                val winner = mergedImportName(current, r.name)
+                if (winner != current) {
+                    updates.add(r.copy(name = winner))
+                    working[key] = winner
+                }
+            }
+        }
+        return MergePlan(inserts, updates)
+    }
+
+    /** The Status line text for the last watch check, without its time. */
+    fun watchStatusText(result: Int, added: Int): String = when (result) {
+        WATCH_RESULT_IMPORTED ->
+            if (added == 1) "Watch folder: 1 new call imported"
+            else "Watch folder: " + added + " new calls imported"
+        WATCH_RESULT_UNREADABLE -> "Watch folder: a changed backup could not be read"
+        else -> "Watch folder: up to date"
     }
 
     /**
@@ -672,6 +779,101 @@ object VaultLogic {
                 .append(csvQuote(r.subscriptionId)).append('\n')
         }
         return sb.toString()
+    }
+
+    /**
+     * Split CSV text into rows of fields, honouring the quoting
+     * [csvQuote] writes: quoted fields may contain commas, doubled
+     * quotes and newlines. A trailing row without a final newline
+     * is still returned. Pure tokenizer, shared by the parser and
+     * the tests.
+     */
+    fun parseCsvRows(text: String): List<List<String>> {
+        val rows = ArrayList<List<String>>()
+        var row = ArrayList<String>()
+        val field = StringBuilder()
+        var inQuotes = false
+        var fieldStarted = false
+        fun endField() {
+            row.add(field.toString())
+            field.setLength(0)
+            fieldStarted = false
+        }
+        fun endRow() {
+            endField()
+            rows.add(row)
+            row = ArrayList()
+        }
+        var i = 0
+        while (i < text.length) {
+            val c = text[i]
+            when {
+                inQuotes -> {
+                    if (c == '"') {
+                        if (i + 1 < text.length && text[i + 1] == '"') {
+                            field.append('"')
+                            i++
+                        } else {
+                            inQuotes = false
+                        }
+                    } else {
+                        field.append(c)
+                    }
+                }
+                c == '"' && !fieldStarted -> {
+                    inQuotes = true
+                    fieldStarted = true
+                }
+                c == ',' -> endField()
+                c == '\n' -> endRow()
+                c == '\r' -> {
+                    // Part of a CRLF pair, or a lone row end: the
+                    // following LF (if any) finishes the row.
+                    if (i + 1 >= text.length || text[i + 1] != '\n') endRow()
+                }
+                else -> {
+                    field.append(c)
+                    fieldStarted = true
+                }
+            }
+            i++
+        }
+        if (fieldStarted || field.isNotEmpty() || row.isNotEmpty()) endRow()
+        return rows
+    }
+
+    /** True when [row] is the header row [generateCsv] writes. */
+    fun isCsvHeaderRow(row: List<String>): Boolean =
+        row.size >= 3 && row[0] == "number" && row[2] == "date_ms"
+
+    /**
+     * Parse a calls.csv in the [generateCsv] format back into
+     * records. The header row is skipped; rows with too few fields
+     * or an unreadable date are skipped. Column order is the export
+     * order: number, name, date_ms, date, type, type_label,
+     * duration_sec, subscription_id.
+     */
+    fun parseCallsCsv(csv: String): List<CallRecord> {
+        val out = ArrayList<CallRecord>()
+        for (row in parseCsvRows(csv)) {
+            if (isCsvHeaderRow(row)) continue
+            if (row.size < 7) continue
+            val number = row[0]
+            if (number.isBlank()) continue
+            val date = row[2].toLongOrNull() ?: continue
+            out.add(
+                CallRecord(
+                    numberRaw = number,
+                    numberNorm = normalizeNumber(number),
+                    name = row[1],
+                    dateMs = date,
+                    type = row[4].toIntOrNull() ?: TYPE_INCOMING,
+                    durationSec = row[6].toLongOrNull() ?: 0L,
+                    subscriptionId = if (row.size > 7) row[7] else ""
+                )
+            )
+        }
+        return out
     }
 
     // ----------------------------------------------------------------- JSON

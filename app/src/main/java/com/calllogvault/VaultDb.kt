@@ -83,6 +83,37 @@ class VaultDb(context: Context) : SQLiteOpenHelper(context, "vault.db", null, 1)
     }
 
     /**
+     * Every dedupe key in the vault mapped to its saved name. The
+     * watch folder merge plans against this map (which records are
+     * new, which saved names an import would replace).
+     */
+    fun namesByKey(db: SQLiteDatabase): HashMap<String, String> {
+        val map = HashMap<String, String>()
+        db.rawQuery("SELECT number_norm, date_ms, type, name_cached FROM calls", null).use { c ->
+            while (c.moveToNext()) {
+                map[VaultLogic.dedupeKey(c.getString(0), c.getLong(1), c.getInt(2))] =
+                    c.getString(3) ?: ""
+            }
+        }
+        return map
+    }
+
+    /**
+     * Replace only the saved name of the row with this record's
+     * dedupe identity. Used by the watch folder merge when a later
+     * import carries a different name for a call the vault already
+     * holds. Returns the number of rows changed (0 or 1).
+     */
+    fun updateName(db: SQLiteDatabase, r: VaultLogic.CallRecord): Int {
+        val cv = ContentValues()
+        cv.put("name_cached", r.name)
+        return db.update(
+            "calls", cv, "number_norm = ? AND date_ms = ? AND type = ?",
+            arrayOf(r.numberNorm, r.dateMs.toString(), r.type.toString())
+        )
+    }
+
+    /**
      * Column positions for one cursor, resolved once per query.
      * Before v1.0.6 readRow called getColumnIndexOrThrow (a name
      * lookup over the cursor's column list) eight times for EVERY

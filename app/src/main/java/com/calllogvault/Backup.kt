@@ -46,8 +46,12 @@ object Backup {
             "Imagined by Arjun\n"
     }
 
-    /** Write the four backup entries for [records] into an open ZIP stream. */
-    fun writeZipEntries(zip: ZipOutputStream, records: List<VaultLogic.CallRecord>) {
+    /**
+     * Write the four backup entries for [records] into an open ZIP
+     * stream. Returns the exact calls.json text written, so the
+     * rolling writer can fingerprint its own write byte for byte.
+     */
+    fun writeZipEntries(zip: ZipOutputStream, records: List<VaultLogic.CallRecord>): String {
         val now = System.currentTimeMillis()
         val backupSet = UUID.randomUUID().toString()
         fun entry(name: String, text: String) {
@@ -57,10 +61,12 @@ object Backup {
             zip.write(text.toByteArray(Charsets.UTF_8))
             zip.closeEntry()
         }
-        entry("calls.json", VaultLogic.generateJson(records, now))
+        val json = VaultLogic.generateJson(records, now)
+        entry("calls.json", json)
         entry("calls.csv", VaultLogic.generateCsv(records))
         entry("calls.xml", VaultLogic.generateCallsXml(records, backupSet, now))
         entry("README.txt", readmeText())
+        return json
     }
 
     /** Write a full backup ZIP to the SAF stream. Returns the record count. */
@@ -273,16 +279,47 @@ object AutoBackup {
         prefs(context).getString(KEY_FILE_URI, "") ?: ""
 
     /**
+     * The remembered rolling file document Uri, shared with the
+     * watch folder reader so it can open the file directly instead
+     * of listing the folder on every check.
+     */
+    fun rollingFileUriString(context: Context): String = fileUriString(context)
+
+    /** Remember a rolling file Uri the watch reader found by listing. */
+    fun rememberRollingFileUri(context: Context, uriString: String) {
+        prefs(context).edit().putString(KEY_FILE_URI, uriString).apply()
+    }
+
+    /**
+     * The exact calls.json bytes of the last write this process
+     * made, kept so the write can store the watch fingerprint of
+     * precisely what it wrote (never a read back, which a sync tool
+     * could already have replaced).
+     */
+    @Volatile
+    private var lastWrittenJsonBytes: ByteArray? = null
+
+    /**
      * Entry point for AutoBackupJobService. Decides from the chosen
      * schedule (or a pending immediate request from the folder pick,
      * which bypasses the schedule) whether to write, then writes
      * through the guarded path. Never throws.
+     *
+     * The watch import runs FIRST, before the write decision
+     * (v1.1.0): one scheduled run then merges both directions, the
+     * folder's newer file into the vault and the merged vault back
+     * into the folder. An import that changed the vault (records
+     * added or names replaced) forces the write back even when the
+     * schedule would have waited, so the merged file is what the
+     * other device sees next. The watch check itself is inert
+     * unless the user turned the watch switch on.
      */
     fun runScheduledWrite(context: Context): Boolean {
         if (!hasFolder(context)) return false
         val force = consumeForceRequest(context)
+        val watchChanged = WatchFolder.importFromFolderIfChanged(context).changed
         val now = System.currentTimeMillis()
-        if (!force && !VaultLogic.shouldWriteBackup(
+        if (!force && !watchChanged && !VaultLogic.shouldWriteBackup(
                 schedule(context), lastWriteMs(context), newSince(context), now
             )
         ) {
@@ -310,6 +347,15 @@ object AutoBackup {
                 .putInt(KEY_SINCE, 0)
                 .putBoolean(KEY_ERROR, false)
                 .apply()
+            // The watch folder skips any file whose fingerprint it
+            // already knows; recording this write's fingerprint is
+            // what stops the app importing its own backup straight
+            // back. Best effort: a failed store only costs one
+            // harmless deduped re-check later.
+            val jsonBytes = lastWrittenJsonBytes
+            if (jsonBytes != null) {
+                WatchFolder.storeOwnWriteFingerprint(context, jsonBytes)
+            }
             true
         } catch (e: Exception) {
             // Silent by design: the drawer row shows "needs attention".
@@ -357,9 +403,10 @@ object AutoBackup {
             prefs(context).edit().putString(KEY_FILE_URI, targetUri.toString()).apply()
         }
 
-        stream.use { raw ->
+        val jsonText = stream.use { raw ->
             ZipOutputStream(raw).use { zip -> Backup.writeZipEntries(zip, records) }
         }
+        lastWrittenJsonBytes = jsonText.toByteArray(Charsets.UTF_8)
         return records.size
     }
 
@@ -386,5 +433,376 @@ object AutoBackup {
         return DocumentsContract.createDocument(
             resolver, folderDocUri, "application/zip", VaultLogic.AUTO_BACKUP_FILENAME
         ) ?: throw IllegalStateException("Could not create the auto backup file")
+    }
+}
+
+/**
+ * Watch folder import (v1.1.0, GitHub issue #3 part 2). The watched
+ * folder IS the auto backup folder: when the user's own folder sync
+ * tool (Syncthing, Dropsync, a cloud drive folder, anything they
+ * already trust) carries another device's rolling backup into it,
+ * this app imports the new records into the vault. No server, no
+ * account, no pairing: the folder is the whole transport, and this
+ * app never sends or receives anything itself.
+ *
+ * Checks piggyback existing wakeups only, never a poll: inside the
+ * scheduled auto backup run (before its write decision, in
+ * AutoBackup.runScheduledWrite), on app open alongside the sync, and
+ * after a manual import or restore (both end in a refresh, which
+ * checks too). Loop prevention is a stored fingerprint of the
+ * folder file (its size plus the SHA-256 of the backup entry): own
+ * writes record theirs, so the app never imports its own backup
+ * straight back, and an unchanged file is never even parsed.
+ *
+ * Imports are additive only. Records arrive; deletions never
+ * travel, so a manual delete on one device can never eat another
+ * device's history. When the same call exists on both devices with
+ * different saved names, the later import's name wins
+ * (VaultLogic.planWatchMerge). Auto restore to the phone call log
+ * is a separate switch, default off.
+ */
+object WatchFolder {
+
+    private const val KEY_ENABLED = "watch_enabled"
+    private const val KEY_AUTO_RESTORE = "watch_auto_restore"
+    private const val KEY_FINGERPRINT = "watch_fingerprint"
+    private const val KEY_LAST_RESULT = "watch_last_result"
+    private const val KEY_LAST_ADDED = "watch_last_added"
+    private const val KEY_LAST_AT = "watch_last_at"
+
+    /** Outcome when a check did nothing: off, no folder, no file, or an aborted read. */
+    const val OUTCOME_SKIPPED = 0
+
+    /**
+     * Outcome of one watch check. [changed] is what callers act on:
+     * a changed vault after an import makes the scheduled auto
+     * backup run write the merged vault back to the folder.
+     */
+    data class WatchResult(val added: Int, val namesUpdated: Int, val outcome: Int) {
+        val changed: Boolean get() = added > 0 || namesUpdated > 0
+    }
+
+    private fun prefs(context: Context) =
+        context.getSharedPreferences(UiKit.PREFS, Context.MODE_PRIVATE)
+
+    fun watchEnabled(context: Context): Boolean =
+        prefs(context).getBoolean(KEY_ENABLED, false)
+
+    fun setWatchEnabled(context: Context, value: Boolean) {
+        prefs(context).edit().putBoolean(KEY_ENABLED, value).apply()
+    }
+
+    fun autoRestore(context: Context): Boolean =
+        prefs(context).getBoolean(KEY_AUTO_RESTORE, false)
+
+    fun setAutoRestore(context: Context, value: Boolean) {
+        prefs(context).edit().putBoolean(KEY_AUTO_RESTORE, value).apply()
+    }
+
+    private fun storedFingerprint(context: Context): String =
+        prefs(context).getString(KEY_FINGERPRINT, "") ?: ""
+
+    private fun storeFingerprint(context: Context, fingerprint: String) {
+        prefs(context).edit().putString(KEY_FINGERPRINT, fingerprint).apply()
+    }
+
+    // ------------------------------------------------------------ Status
+
+    private fun recordStatus(context: Context, result: Int, added: Int) {
+        prefs(context).edit()
+            .putInt(KEY_LAST_RESULT, result)
+            .putInt(KEY_LAST_ADDED, added)
+            .putLong(KEY_LAST_AT, System.currentTimeMillis())
+            .apply()
+    }
+
+    /** The Status line for the watch, or null when no check has ever completed. */
+    fun statusLine(context: Context): String? {
+        val result = prefs(context).getInt(KEY_LAST_RESULT, 0)
+        val at = prefs(context).getLong(KEY_LAST_AT, 0L)
+        if (result == 0 || at <= 0) return null
+        val base = VaultLogic.watchStatusText(
+            result, prefs(context).getInt(KEY_LAST_ADDED, 0)
+        )
+        return if (result == VaultLogic.WATCH_RESULT_IMPORTED ||
+            result == VaultLogic.WATCH_RESULT_UNREADABLE
+        ) {
+            base + ", " + VaultLogic.formatTime(at)
+        } else {
+            base
+        }
+    }
+
+    // ------------------------------------------------------- File access
+
+    /**
+     * The rolling file in the watched folder, or null when it is not
+     * there. The remembered document Uri is tried first; one listing
+     * pass (the writer's own fallback pattern) finds it by name and
+     * remembers it, so steady state checks never list the folder.
+     */
+    private fun locateRollingFile(context: Context): Uri? {
+        val remembered = AutoBackup.rollingFileUriString(context)
+        if (remembered.isNotBlank()) {
+            val uri = Uri.parse(remembered)
+            if (documentExists(context, uri)) return uri
+        }
+        val treeString = AutoBackup.folderUriString(context)
+        if (treeString.isBlank()) return null
+        val treeUri = Uri.parse(treeString)
+        val resolver = context.contentResolver
+        return try {
+            val treeDocId = DocumentsContract.getTreeDocumentId(treeUri)
+            val childrenUri = DocumentsContract.buildChildDocumentsUriUsingTree(treeUri, treeDocId)
+            var found: Uri? = null
+            resolver.query(
+                childrenUri,
+                arrayOf(
+                    DocumentsContract.Document.COLUMN_DOCUMENT_ID,
+                    DocumentsContract.Document.COLUMN_DISPLAY_NAME
+                ),
+                null, null, null
+            )?.use { c ->
+                while (c.moveToNext()) {
+                    if ((c.getString(1) ?: "") == VaultLogic.AUTO_BACKUP_FILENAME) {
+                        found = DocumentsContract.buildDocumentUriUsingTree(treeUri, c.getString(0))
+                        break
+                    }
+                }
+            }
+            if (found != null) AutoBackup.rememberRollingFileUri(context, found.toString())
+            found
+        } catch (e: Exception) {
+            null
+        }
+    }
+
+    private fun documentExists(context: Context, uri: Uri): Boolean {
+        return try {
+            context.contentResolver.query(
+                uri, arrayOf(DocumentsContract.Document.COLUMN_DOCUMENT_ID), null, null, null
+            )?.use { it.moveToFirst() } == true
+        } catch (e: Exception) {
+            false
+        }
+    }
+
+    /** The file's size from the provider, or -1 when it will not say. */
+    private fun documentSize(context: Context, uri: Uri): Long {
+        return try {
+            context.contentResolver.query(
+                uri, arrayOf(DocumentsContract.Document.COLUMN_SIZE), null, null, null
+            )?.use { c ->
+                if (c.moveToFirst() && !c.isNull(0)) c.getLong(0) else -1L
+            } ?: -1L
+        } catch (e: Exception) {
+            -1L
+        }
+    }
+
+    /** One full read of the rolling file: its backup entries and the sizes around the read. */
+    private class FolderRead(
+        val sizeBefore: Long,
+        val sizeAfter: Long,
+        val json: ByteArray?,
+        val csv: ByteArray?,
+        val xml: ByteArray?
+    ) {
+        /** The entry the fingerprint hashes: the first one the import would read. */
+        val entryBytes: ByteArray get() = json ?: csv ?: xml ?: ByteArray(0)
+
+        val fingerprint: String get() = VaultLogic.zipFingerprint(sizeAfter, entryBytes)
+    }
+
+    /**
+     * Read the rolling file's backup entries. Returns null when the
+     * file cannot be opened or read at all. A file that opens but is
+     * not a ZIP still returns, with every entry null: that is the
+     * corrupt file case, and it flows into the unreadable path with
+     * a fingerprint like any other read.
+     */
+    private fun readFolderFile(context: Context, fileUri: Uri): FolderRead? {
+        val sizeBefore = documentSize(context, fileUri)
+        var json: ByteArray? = null
+        var csv: ByteArray? = null
+        var xml: ByteArray? = null
+        try {
+            context.contentResolver.openInputStream(fileUri)?.use { raw: InputStream ->
+                ZipInputStream(raw).use { zip ->
+                    var entry = zip.nextEntry
+                    while (entry != null) {
+                        val name = entry.name.substringAfterLast('/')
+                        if (name.equals("calls.json", true) || name.equals("calls.csv", true) ||
+                            name.equals("calls.xml", true)
+                        ) {
+                            val buf = ByteArrayOutputStream()
+                            val chunk = ByteArray(8192)
+                            while (true) {
+                                val n = zip.read(chunk)
+                                if (n < 0) break
+                                buf.write(chunk, 0, n)
+                            }
+                            val bytes = buf.toByteArray()
+                            when {
+                                name.equals("calls.json", true) -> json = bytes
+                                name.equals("calls.csv", true) -> csv = bytes
+                                else -> xml = bytes
+                            }
+                        }
+                        zip.closeEntry()
+                        entry = zip.nextEntry
+                    }
+                }
+            } ?: return null
+        } catch (e: Exception) {
+            return null
+        }
+        return FolderRead(sizeBefore, documentSize(context, fileUri), json, csv, xml)
+    }
+
+    /**
+     * The current fingerprint of the rolling file in the folder, or
+     * null when there is no folder, no file, or the file cannot be
+     * read at all.
+     */
+    fun readFolderFingerprint(context: Context): String? {
+        if (!AutoBackup.hasFolder(context)) return null
+        val fileUri = locateRollingFile(context) ?: return null
+        return readFolderFile(context, fileUri)?.fingerprint
+    }
+
+    /**
+     * Record the fingerprint of a write this app just made, from
+     * the exact calls.json bytes it wrote and the written file's
+     * size. Never throws; on any doubt nothing is stored, and the
+     * next check simply re-reads the file (a harmless deduped
+     * no-op against the vault).
+     */
+    fun storeOwnWriteFingerprint(context: Context, jsonBytes: ByteArray) {
+        try {
+            val fileUri = locateRollingFile(context) ?: return
+            val size = documentSize(context, fileUri)
+            if (size < 0) return
+            storeFingerprint(context, VaultLogic.zipFingerprint(size, jsonBytes))
+        } catch (ignored: Exception) {
+        }
+    }
+
+    // ------------------------------------------------------------ Import
+
+    private sealed class Parsed {
+        class Ok(val records: List<VaultLogic.CallRecord>) : Parsed()
+        object Unreadable : Parsed()
+    }
+
+    /**
+     * Parse the folder file's entries under the watch acceptance
+     * rule: only this app's own backup format. calls.json is the
+     * primary entry; calls.csv and then calls.xml are the fallbacks,
+     * the same entries the manual import reads. An entry only
+     * counts when its structure checks out (a JSON root with a
+     * calls list, the CSV header row, a calls XML root): a damaged
+     * entry never hides a good one behind it, and a foreign file
+     * with none of them is Unreadable. A structurally valid backup
+     * with zero calls is Ok with an empty list, not an error.
+     */
+    private fun parseEntries(json: ByteArray?, csv: ByteArray?, xml: ByteArray?): Parsed {
+        if (json != null) {
+            val text = String(json, Charsets.UTF_8)
+            val root = try {
+                VaultLogic.JsonParser(text).parse() as? Map<*, *>
+            } catch (e: Exception) {
+                null
+            }
+            if (root != null && root["calls"] is List<*>) {
+                return Parsed.Ok(VaultLogic.parseCallsJson(text))
+            }
+        }
+        if (csv != null) {
+            val text = String(csv, Charsets.UTF_8)
+            if (VaultLogic.parseCsvRows(text).any { VaultLogic.isCsvHeaderRow(it) }) {
+                return Parsed.Ok(VaultLogic.parseCallsCsv(text))
+            }
+        }
+        if (xml != null) {
+            val text = String(xml, Charsets.UTF_8)
+            if (text.contains("<calls")) {
+                return Parsed.Ok(VaultLogic.parseCallsXml(text))
+            }
+        }
+        return Parsed.Unreadable
+    }
+
+    /**
+     * One watch check: import the folder's rolling file into the
+     * vault when it changed since the last known fingerprint.
+     * No-ops quietly when watching is off, no folder is set, or no
+     * file is there. An unreadable changed file is noted in Status
+     * and remembered, so it is not re-read at every wakeup; a file
+     * whose size moves during the read (a sync tool still copying
+     * it) is aborted quietly and retried by the next check. Merging
+     * is one transaction through VaultLogic.planWatchMerge. Never
+     * throws.
+     */
+    fun importFromFolderIfChanged(context: Context): WatchResult {
+        val skipped = WatchResult(0, 0, OUTCOME_SKIPPED)
+        try {
+            if (!watchEnabled(context) || !AutoBackup.hasFolder(context)) return skipped
+            val fileUri = locateRollingFile(context) ?: return skipped
+            val read = readFolderFile(context, fileUri) ?: run {
+                recordStatus(context, VaultLogic.WATCH_RESULT_UNREADABLE, 0)
+                return WatchResult(0, 0, VaultLogic.WATCH_RESULT_UNREADABLE)
+            }
+            if (!VaultLogic.shouldImportWatched(storedFingerprint(context), read.fingerprint, true)) {
+                recordStatus(context, VaultLogic.WATCH_RESULT_UP_TO_DATE, 0)
+                return WatchResult(0, 0, VaultLogic.WATCH_RESULT_UP_TO_DATE)
+            }
+            if (read.sizeBefore >= 0 && read.sizeAfter >= 0 && read.sizeBefore != read.sizeAfter) {
+                return skipped
+            }
+            return when (val parsed = parseEntries(read.json, read.csv, read.xml)) {
+                Parsed.Unreadable -> {
+                    storeFingerprint(context, read.fingerprint)
+                    recordStatus(context, VaultLogic.WATCH_RESULT_UNREADABLE, 0)
+                    WatchResult(0, 0, VaultLogic.WATCH_RESULT_UNREADABLE)
+                }
+                is Parsed.Ok -> {
+                    val helper = VaultDb.get(context)
+                    val db = helper.writableDatabase
+                    val plan = VaultLogic.planWatchMerge(helper.namesByKey(db), parsed.records)
+                    val addedRecords = ArrayList<VaultLogic.CallRecord>()
+                    var namesUpdated = 0
+                    db.beginTransaction()
+                    try {
+                        for (r in plan.inserts) {
+                            if (helper.insertIgnore(db, r)) addedRecords.add(r)
+                        }
+                        for (r in plan.nameUpdates) {
+                            namesUpdated += helper.updateName(db, r)
+                        }
+                        db.setTransactionSuccessful()
+                    } finally {
+                        db.endTransaction()
+                    }
+                    storeFingerprint(context, read.fingerprint)
+                    if (autoRestore(context) && addedRecords.isNotEmpty()) {
+                        // Exactly the records this import added,
+                        // oldest first like every other restore.
+                        // The restore itself skips anything the
+                        // phone log already holds.
+                        SyncEngine.restore(context, addedRecords.sortedBy { it.dateMs })
+                    }
+                    val outcome = if (addedRecords.isNotEmpty()) {
+                        VaultLogic.WATCH_RESULT_IMPORTED
+                    } else {
+                        VaultLogic.WATCH_RESULT_UP_TO_DATE
+                    }
+                    recordStatus(context, outcome, addedRecords.size)
+                    WatchResult(addedRecords.size, namesUpdated, outcome)
+                }
+            }
+        } catch (e: Exception) {
+            return skipped
+        }
     }
 }
