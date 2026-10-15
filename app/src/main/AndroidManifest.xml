@@ -18,7 +18,7 @@
         <activity android:name="com.calllogvault.MainActivity"
             android:exported="true"
             android:launchMode="singleTask"
-            android:configChanges="orientation|screenSize|keyboardHidden|uiMode">
+            android:configChanges="orientation|screenSize|keyboardHidden">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
@@ -27,7 +27,7 @@
 
         <activity android:name="com.calllogvault.PersonActivity"
             android:exported="false"
-            android:configChanges="orientation|screenSize|keyboardHidden|uiMode" />
+            android:configChanges="orientation|screenSize|keyboardHidden" />
 
         <!-- Sniffer: woken by JobScheduler content triggers on the call log. -->
         <service android:name="com.calllogvault.VaultJobService"
