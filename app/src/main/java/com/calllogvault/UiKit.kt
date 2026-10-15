@@ -18,12 +18,15 @@ import android.widget.TextView
  * color blending for avatar tiles, the medium typeface (created once),
  * and the Light / Dark / AMOLED appearance presets.
  *
- * Appearance v2 (v1.0.2): values live under a new prefs key
- * "appearance_v2" with VaultLogic.APPEARANCE_* values. The v1.0.1
- * values under the old "appearance" key (System 0, Light 1, Dark 2)
- * are only read once, through VaultLogic.resolveAppearance, so old
- * data can never be misread: explicit legacy Light or Dark carries
- * over, everything else becomes AMOLED, the new default.
+ * Appearance v2 (v1.0.2): the mode lives under a new prefs key
+ * "appearance_v2" with VaultLogic.APPEARANCE_* values (Light, Dark,
+ * Auto). A separate boolean pref, "amoled_for_dark", says whether
+ * the Dark side renders AMOLED. Older state (the v1.0.1 values
+ * under the old "appearance" key, a stored AMOLED preset, the
+ * v1.0.8 "appearance_dark_flavour") is read exactly once, through
+ * VaultLogic.migrateAppearance, and rewritten in the current
+ * scheme, so old data can never be misread and every user keeps
+ * the exact look they had.
  * Framework APIs only, no AppCompat.
  */
 fun View.pressFeedback() {
@@ -50,6 +53,9 @@ object UiKit {
     const val PREFS = "vault_prefs"
     private const val KEY_APPEARANCE_V2 = "appearance_v2"
     private const val KEY_APPEARANCE_LEGACY = "appearance"
+    private const val KEY_AMOLED_FOR_DARK = "amoled_for_dark"
+
+    /** Read only by the one time migration; never written anymore. */
     private const val KEY_DARK_FLAVOUR = "appearance_dark_flavour"
 
     const val APPEARANCE_LIGHT = VaultLogic.APPEARANCE_LIGHT
@@ -63,69 +69,83 @@ object UiKit {
     }
 
     /**
-     * The resolved appearance, kept in memory after the first
-     * resolve (v1.0.6). appearance() is called from attachBaseContext,
-     * from both activities' getResources() overrides on effectively
-     * every resource lookup path, and from wrapContext, so reading
-     * SharedPreferences (a disk backed map) on every call taxed the
-     * whole UI for a value that changes only when the user taps a
-     * theme segment. The cache makes those call sites a volatile
-     * read plus a flag test; resolution results are identical.
+     * The stored appearance state (mode plus the AMOLED switch),
+     * kept in memory after the first resolve (v1.0.6). appearance()
+     * is called from attachBaseContext, from both activities'
+     * getResources() overrides on effectively every resource lookup
+     * path, and from wrapContext, so reading SharedPreferences (a
+     * disk backed map) on every call taxed the whole UI for values
+     * that change only when the user taps a theme control. The
+     * caches make those call sites a volatile read plus a flag test;
+     * resolution results are identical.
      */
     @Volatile
     private var cachedAppearance: Int? = null
 
-    fun appearance(context: Context): Int {
-        cachedAppearance?.let { return it }
+    @Volatile
+    private var cachedAmoledForDark: Boolean? = null
+
+    /**
+     * Fill both caches from prefs. While the amoled_for_dark key is
+     * absent the stored state predates the current scheme (or there
+     * is none yet), so it goes through the one time migration in
+     * VaultLogic and is rewritten as a mode plus the switch; after
+     * that, reads are direct and the old flavour key is never
+     * consulted again.
+     */
+    private fun resolveStored(context: Context) {
+        if (cachedAppearance != null && cachedAmoledForDark != null) return
         val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-        val hasV2 = prefs.contains(KEY_APPEARANCE_V2)
-        val resolved = VaultLogic.resolveAppearance(
-            hasV2 = hasV2,
-            v2 = if (hasV2) prefs.getInt(KEY_APPEARANCE_V2, APPEARANCE_AMOLED) else 0,
-            hasLegacy = prefs.contains(KEY_APPEARANCE_LEGACY),
-            legacy = prefs.getInt(KEY_APPEARANCE_LEGACY, 0)
-        )
-        if (!hasV2) {
-            // Migrate on first resolve so later reads are direct.
-            prefs.edit().putInt(KEY_APPEARANCE_V2, resolved).apply()
+        if (!prefs.contains(KEY_AMOLED_FOR_DARK)) {
+            val hasV2 = prefs.contains(KEY_APPEARANCE_V2)
+            val state = VaultLogic.migrateAppearance(
+                hasV2 = hasV2,
+                v2 = if (hasV2) prefs.getInt(KEY_APPEARANCE_V2, APPEARANCE_DARK) else 0,
+                hasFlavour = prefs.contains(KEY_DARK_FLAVOUR),
+                flavour = prefs.getInt(KEY_DARK_FLAVOUR, APPEARANCE_AMOLED),
+                hasLegacy = prefs.contains(KEY_APPEARANCE_LEGACY),
+                legacy = prefs.getInt(KEY_APPEARANCE_LEGACY, 0)
+            )
+            prefs.edit()
+                .putInt(KEY_APPEARANCE_V2, state.mode)
+                .putBoolean(KEY_AMOLED_FOR_DARK, state.amoledForDark)
+                .apply()
+            cachedAppearance = state.mode
+            cachedAmoledForDark = state.amoledForDark
+            return
         }
-        cachedAppearance = resolved
-        return resolved
+        val stored = prefs.getInt(KEY_APPEARANCE_V2, APPEARANCE_DARK)
+        cachedAppearance =
+            if (stored == APPEARANCE_LIGHT || stored == APPEARANCE_DARK ||
+                stored == APPEARANCE_AUTO
+            ) stored else APPEARANCE_DARK
+        cachedAmoledForDark = prefs.getBoolean(KEY_AMOLED_FOR_DARK, true)
+    }
+
+    /** The stored mode: Light, Dark or Auto. */
+    fun appearance(context: Context): Int {
+        resolveStored(context)
+        return cachedAppearance!!
     }
 
     fun setAppearance(context: Context, value: Int) {
-        val edit = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
             .putInt(KEY_APPEARANCE_V2, value)
-        // An explicit Dark or AMOLED pick is also the flavour the
-        // Auto mode falls back to at night, so it is remembered.
-        if (value == APPEARANCE_DARK || value == APPEARANCE_AMOLED) {
-            edit.putInt(KEY_DARK_FLAVOUR, value)
-            cachedDarkFlavour = value
-        }
-        edit.apply()
+            .apply()
         cachedAppearance = value
     }
 
-    /** In memory copy of the dark flavour, same reasoning as above. */
-    @Volatile
-    private var cachedDarkFlavour: Int? = null
+    /** Whether the Dark side (Dark mode, and Auto at night) renders AMOLED. */
+    fun amoledForDark(context: Context): Boolean {
+        resolveStored(context)
+        return cachedAmoledForDark!!
+    }
 
-    /**
-     * The dark flavour for Auto mode: whichever of Dark or AMOLED
-     * the user last chose explicitly. Defaults to AMOLED when
-     * neither was ever picked (AMOLED is also the fresh install
-     * appearance, so an untouched install behaves exactly as
-     * before when the user switches to Auto).
-     */
-    fun darkFlavour(context: Context): Int {
-        cachedDarkFlavour?.let { return it }
-        val stored = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-            .getInt(KEY_DARK_FLAVOUR, APPEARANCE_AMOLED)
-        val resolved =
-            if (stored == APPEARANCE_DARK || stored == APPEARANCE_AMOLED) stored
-            else APPEARANCE_AMOLED
-        cachedDarkFlavour = resolved
-        return resolved
+    fun setAmoledForDark(context: Context, value: Boolean) {
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
+            .putBoolean(KEY_AMOLED_FOR_DARK, value)
+            .apply()
+        cachedAmoledForDark = value
     }
 
     /** True when [res] carries the night uiMode flag. */
@@ -135,13 +155,13 @@ object UiKit {
 
     /**
      * The concrete preset to render with: the stored mode resolved
-     * through VaultLogic against the dark flavour and the night
+     * through VaultLogic against the AMOLED switch and the night
      * flag of [res]. Callers inside a getResources() override pass
      * the base resources they already hold; nothing here reads
      * context.resources, so that call path can never loop.
      */
     fun concreteAppearance(context: Context, res: Resources): Int =
-        VaultLogic.resolveAppearance(appearance(context), darkFlavour(context), systemNight(res))
+        VaultLogic.resolveAppearance(appearance(context), amoledForDark(context), systemNight(res))
 
     /** Concrete preset for ordinary UI thread call sites. */
     fun concreteAppearance(context: Context): Int =
@@ -153,15 +173,16 @@ object UiKit {
     fun appearanceName(value: Int): String = VaultLogic.appearanceName(value)
 
     /**
-     * Force the night flag to match the chosen preset (AMOLED is night
-     * plus the black resource substitution below). The Auto mode is
-     * the one exception: the system night flag passes through
-     * untouched, so the concrete preset can follow the device (and
-     * the manifest leaves uiMode recreation to the system, so a
-     * flip while the app runs rethemes through a fresh activity).
+     * Force the night flag to match the chosen mode (the AMOLED
+     * rendering of Dark is night plus the black resource
+     * substitution below). The Auto mode is the one exception: the
+     * system night flag passes through untouched, so the concrete
+     * preset can follow the device (and the manifest leaves uiMode
+     * recreation to the system, so a flip while the app runs
+     * rethemes through a fresh activity).
      */
     fun wrapContext(newBase: Context): Context {
-        val mode = try { appearance(newBase) } catch (e: Exception) { APPEARANCE_AMOLED }
+        val mode = try { appearance(newBase) } catch (e: Exception) { APPEARANCE_DARK }
         if (mode == APPEARANCE_AUTO) return newBase
         val night = if (mode == APPEARANCE_LIGHT)
             Configuration.UI_MODE_NIGHT_NO else Configuration.UI_MODE_NIGHT_YES

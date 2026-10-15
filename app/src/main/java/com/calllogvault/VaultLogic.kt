@@ -404,14 +404,18 @@ object VaultLogic {
     private val WHITESPACE = Regex("\\s+")
 
     // Appearance v2 values, stored under a new prefs key in v1.0.2.
+    // LIGHT, DARK and AUTO are the stored modes. AMOLED is a concrete
+    // render preset only: since the appearance refinement it is no
+    // longer stored as a mode of its own; the Dark mode renders it
+    // whenever the amoled_for_dark switch is on.
     const val APPEARANCE_LIGHT = 0
     const val APPEARANCE_DARK = 1
     const val APPEARANCE_AMOLED = 2
 
     /**
-     * Follow the device (v1.0.8): not a concrete preset of its own,
-     * it resolves through [resolveAppearance] mode overload below
-     * using the system night flag and the stored dark flavour.
+     * Follow the device: not a concrete preset of its own, it
+     * resolves through [resolveAppearance] below using the system
+     * night flag and the amoled_for_dark switch.
      */
     const val APPEARANCE_AUTO = 3
 
@@ -420,44 +424,81 @@ object VaultLogic {
     const val LEGACY_APPEARANCE_LIGHT = 1
     const val LEGACY_APPEARANCE_DARK = 2
 
+    /** The appearance state in the current scheme: a mode plus the switch. */
+    data class AppearanceState(val mode: Int, val amoledForDark: Boolean)
+
     /**
-     * Resolve the v2 appearance from stored state.
-     * A stored v2 value wins (unknown v2 values fall back to AMOLED).
-     * Without a v2 value, an explicit legacy Light or Dark carries over,
-     * and everything else (legacy System, no stored value at all, any
-     * other legacy number) resolves to AMOLED, the v1.0.2 default.
+     * Whether a remembered v1.0.8 dark flavour means the AMOLED
+     * switch starts on. Only an explicit Dark flavour turns it off;
+     * an AMOLED flavour, a missing flavour and any other stored
+     * value all count as on, matching the app's AMOLED defaults.
      */
-    fun resolveAppearance(hasV2: Boolean, v2: Int, hasLegacy: Boolean, legacy: Int): Int {
+    private fun flavourMeansAmoled(hasFlavour: Boolean, flavour: Int): Boolean =
+        !(hasFlavour && flavour == APPEARANCE_DARK)
+
+    /**
+     * Migrate stored appearance state from before the refinement
+     * (where the stored value was a concrete preset and v1.0.8 also
+     * remembered a "dark flavour") into the current scheme of a
+     * mode plus the amoled_for_dark switch, landing every user on
+     * exactly the look they had:
+     * - stored Light stays Light (the switch follows the flavour).
+     * - stored Dark becomes the Dark mode with the switch off.
+     * - stored AMOLED becomes the Dark mode with the switch on.
+     * - stored Auto stays Auto; its night side followed the flavour,
+     *   so the switch takes the flavour (on unless it was Dark).
+     * - an unknown stored value keeps the old fallback look, AMOLED,
+     *   as the Dark mode with the switch on.
+     * Without a v2 value, an explicit legacy Light or Dark carries
+     * over the same way, and everything else (legacy System, no
+     * stored value at all, a fresh install) lands on the Dark mode
+     * with the switch on, the AMOLED look the app has always
+     * defaulted to.
+     */
+    fun migrateAppearance(
+        hasV2: Boolean,
+        v2: Int,
+        hasFlavour: Boolean,
+        flavour: Int,
+        hasLegacy: Boolean,
+        legacy: Int
+    ): AppearanceState {
         if (hasV2) {
-            return if (v2 == APPEARANCE_LIGHT || v2 == APPEARANCE_DARK ||
-                v2 == APPEARANCE_AMOLED || v2 == APPEARANCE_AUTO
-            ) v2 else APPEARANCE_AMOLED
+            return when (v2) {
+                APPEARANCE_LIGHT ->
+                    AppearanceState(APPEARANCE_LIGHT, flavourMeansAmoled(hasFlavour, flavour))
+                APPEARANCE_DARK -> AppearanceState(APPEARANCE_DARK, false)
+                APPEARANCE_AMOLED -> AppearanceState(APPEARANCE_DARK, true)
+                APPEARANCE_AUTO ->
+                    AppearanceState(APPEARANCE_AUTO, flavourMeansAmoled(hasFlavour, flavour))
+                else -> AppearanceState(APPEARANCE_DARK, true)
+            }
         }
-        if (hasLegacy && legacy == LEGACY_APPEARANCE_LIGHT) return APPEARANCE_LIGHT
-        if (hasLegacy && legacy == LEGACY_APPEARANCE_DARK) return APPEARANCE_DARK
-        return APPEARANCE_AMOLED
+        if (hasLegacy && legacy == LEGACY_APPEARANCE_LIGHT) {
+            return AppearanceState(APPEARANCE_LIGHT, flavourMeansAmoled(hasFlavour, flavour))
+        }
+        if (hasLegacy && legacy == LEGACY_APPEARANCE_DARK) {
+            return AppearanceState(APPEARANCE_DARK, false)
+        }
+        return AppearanceState(APPEARANCE_DARK, true)
     }
 
     /**
      * Resolve a stored appearance [mode] to the concrete preset to
-     * render with. Explicit presets resolve to themselves whatever
-     * the system says. AUTO resolves to Light in light mode and to
-     * [darkFlavour] in night mode; the flavour is whichever of Dark
-     * or AMOLED the user last picked on purpose, and any other
-     * stored flavour value (Light, Auto, garbage) counts as AMOLED.
-     * An unknown mode counts as AMOLED, the standing fallback.
+     * render with. Light is always Light. Dark renders AMOLED when
+     * [amoledForDark] is on and plain Dark when it is off. Auto is
+     * Light while the system is not in night mode, and at night it
+     * follows the same switch as Dark. An unknown mode counts as
+     * AMOLED, the standing fallback.
      */
-    fun resolveAppearance(mode: Int, darkFlavour: Int, systemNight: Boolean): Int {
+    fun resolveAppearance(mode: Int, amoledForDark: Boolean, systemNight: Boolean): Int {
         return when (mode) {
             APPEARANCE_LIGHT -> APPEARANCE_LIGHT
-            APPEARANCE_DARK -> APPEARANCE_DARK
-            APPEARANCE_AMOLED -> APPEARANCE_AMOLED
-            APPEARANCE_AUTO -> if (!systemNight) {
-                APPEARANCE_LIGHT
-            } else if (darkFlavour == APPEARANCE_DARK || darkFlavour == APPEARANCE_AMOLED) {
-                darkFlavour
-            } else {
-                APPEARANCE_AMOLED
+            APPEARANCE_DARK -> if (amoledForDark) APPEARANCE_AMOLED else APPEARANCE_DARK
+            APPEARANCE_AUTO -> when {
+                !systemNight -> APPEARANCE_LIGHT
+                amoledForDark -> APPEARANCE_AMOLED
+                else -> APPEARANCE_DARK
             }
             else -> APPEARANCE_AMOLED
         }

@@ -30,6 +30,7 @@ import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.ListView
 import android.widget.ScrollView
+import android.widget.Switch
 import android.widget.TextView
 import android.widget.Toast
 import java.text.SimpleDateFormat
@@ -580,6 +581,7 @@ class MainActivity : Activity() {
 
         body.addView(eyebrow("THEME"))
         body.addView(themeSegment())
+        body.addView(amoledSwitchRow())
 
         val scroll = ScrollView(this)
         scroll.addView(body)
@@ -594,9 +596,12 @@ class MainActivity : Activity() {
     }
 
     /**
-     * Theme presets as drawer segments: four equal
-     * buttons in one rounded container. Tapping one saves the preset
-     * and recreates the activity. The Appearance popup dialog is gone.
+     * Theme modes as drawer segments: three equal buttons in one
+     * rounded container. The middle button is the Dark mode; its
+     * label reads AMOLED while the switch under the segments is on,
+     * because that is what Dark renders then. Tapping a segment
+     * saves the mode and recreates the activity. The Appearance
+     * popup dialog is gone.
      */
     private fun themeSegment(): LinearLayout {
         val wrap = LinearLayout(this).apply {
@@ -612,10 +617,10 @@ class MainActivity : Activity() {
             }
             setPadding(dp(4), dp(4), dp(4), dp(4))
         }
+        val darkLabel = if (UiKit.amoledForDark(this)) "AMOLED" else "Dark"
         val presets = listOf(
             UiKit.APPEARANCE_LIGHT to "Light",
-            UiKit.APPEARANCE_DARK to "Dark",
-            UiKit.APPEARANCE_AMOLED to "AMOLED",
+            UiKit.APPEARANCE_DARK to darkLabel,
             UiKit.APPEARANCE_AUTO to "Auto"
         )
         val current = UiKit.appearance(this)
@@ -655,6 +660,53 @@ class MainActivity : Activity() {
         }
         wrap.addView(row)
         return wrap
+    }
+
+    /**
+     * The AMOLED overlap switch, directly under the theme segments
+     * and styled like the other drawer rows. Flipping it saves the
+     * pref and recreates, the same way a segment tap does, so the
+     * middle segment's label (Dark or AMOLED) and the rendered
+     * theme both follow at once. Tapping the row itself flips the
+     * switch too.
+     */
+    private fun amoledSwitchRow(): LinearLayout {
+        val toggle = Switch(this)
+        val row = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            minimumHeight = dp(56)
+            setPadding(dp(16), dp(8), dp(16), dp(8))
+            isClickable = true
+            isFocusable = true
+            pressFeedback()
+        }
+        row.addView(ImageView(this).apply {
+            layoutParams = LinearLayout.LayoutParams(dp(40), dp(40))
+            setBackgroundResource(R.drawable.tile_squircle)
+            setImageResource(R.drawable.ic_nav_appearance)
+            setColorFilter(color(R.color.tile_icon))
+            scaleType = ImageView.ScaleType.CENTER
+            setPadding(dp(9), dp(9), dp(9), dp(9))
+        })
+        row.addView(TextView(this).apply {
+            text = "Use AMOLED for Dark"
+            textSize = 16f
+            setTextColor(color(R.color.text))
+            layoutParams = LinearLayout.LayoutParams(
+                0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f
+            ).apply { marginStart = dp(16) }
+        })
+        toggle.isChecked = UiKit.amoledForDark(this)
+        toggle.setOnCheckedChangeListener { _, checked ->
+            if (UiKit.amoledForDark(this@MainActivity) != checked) {
+                UiKit.setAmoledForDark(this@MainActivity, checked)
+                recreate()
+            }
+        }
+        row.addView(toggle)
+        row.setOnClickListener { toggle.isChecked = !toggle.isChecked }
+        return row
     }
 
     private fun drawerHeader(): LinearLayout = LinearLayout(this).apply {
@@ -1644,7 +1696,9 @@ class MainActivity : Activity() {
             UiKit.appearanceName(appearanceMode) + " (" +
                 UiKit.appearanceName(UiKit.concreteAppearance(this)) + ")"
         } else {
-            UiKit.appearanceName(appearanceMode)
+            // Explicit modes name their concrete preset, so the Dark
+            // mode with the AMOLED switch on reads AMOLED here.
+            UiKit.appearanceName(UiKit.concreteAppearance(this))
         }
         sb.append("Appearance: ").append(appearanceText).append('\n')
         sb.append("\nDiagnostics\n")
