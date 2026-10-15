@@ -23,8 +23,9 @@ Vibe coded by Arjun to solve his own problem, on his own S24 Ultra.
 
 - The app requests exactly 4 permissions: read call log, write call log (for restore), read contacts (to show names), and receive boot completed (so it restarts after a reboot). Nothing else. There is no internet permission to abuse
 - Every backup is a plain ZIP containing CSV, JSON and XML files. Your data is readable by normal tools, never locked into a weird format
-- Verify the download yourself. SHA-256 of the v1.0.6 APK:
-  `dc4de49f69631ed05d52a7a80992690781959cd64cfe3791faa45536fee22918`
+- Verify the download yourself. SHA-256 of the v1.0.7 APK:
+  `1b0b1b67a89f7e3b2d467ca062bb8d58e8dcfffc40a76572a3e9d29a5c71e020`
+- The full source code is in this repo (see below). Do not take anyone's word for what the app does, read it
 
 ## Install
 
@@ -45,6 +46,14 @@ Your phone's own call log will still trim at 2000, that behaviour is built into 
 ## Restoring
 
 Restoring writes the vault's records back into the Android call log provider, skipping duplicates. Any dialer (Samsung Phone, Google Phone, others) then shows them like normal calls. If you restore more than 2000, the phone dialer will trim the oldest again over time, but the vault always keeps the complete history.
+
+## Source code
+
+The full Kotlin source lives in this repo: `app/` is the app, `tests/` is its JVM test suite, and [BUILDING.md](BUILDING.md) explains how to run the tests and build the APK yourself with your own signing key. No libraries, no Gradle, plain Android framework code.
+
+Official releases are signed with the maintainer's key and published with SHA-256 hashes, so a self-built copy cannot update over an official install, and nobody else's build can pretend to be an update.
+
+Contributions are welcome, open an issue or a pull request. Two house rules: the app keeps exactly its 4 permissions and never gains an internet permission, and contributed code must be readable and unobfuscated.
 
 ## License
 
