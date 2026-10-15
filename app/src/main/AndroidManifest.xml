@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Call Log Vault: fully offline call history vault. NO INTERNET permission on purpose. -->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="pro.calllogvault.app">
+
+    <uses-permission android:name="android.permission.READ_CALL_LOG" />
+    <uses-permission android:name="android.permission.WRITE_CALL_LOG" />
+    <uses-permission android:name="android.permission.READ_CONTACTS" />
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+
+    <application
+        android:label="Call Log Vault"
+        android:icon="@drawable/ic_launcher"
+        android:theme="@style/Theme.CallVault"
+        android:allowBackup="true"
+        android:supportsRtl="true">
+
+        <activity android:name="com.calllogvault.MainActivity"
+            android:exported="true"
+            android:launchMode="singleTask"
+            android:configChanges="orientation|screenSize|keyboardHidden|uiMode">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <activity android:name="com.calllogvault.PersonActivity"
+            android:exported="false"
+            android:configChanges="orientation|screenSize|keyboardHidden|uiMode" />
+
+        <!-- Sniffer: woken by JobScheduler content triggers on the call log. -->
+        <service android:name="com.calllogvault.VaultJobService"
+            android:exported="false"
+            android:permission="android.permission.BIND_JOB_SERVICE" />
+
+        <!-- Auto backup: writes the rolling ZIP to the user folder, as its own job. -->
+        <service android:name="com.calllogvault.AutoBackupJobService"
+            android:exported="false"
+            android:permission="android.permission.BIND_JOB_SERVICE" />
+
+        <receiver android:name="com.calllogvault.BootReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+            </intent-filter>
+        </receiver>
+    </application>
+</manifest>
