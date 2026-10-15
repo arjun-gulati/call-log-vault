@@ -48,8 +48,19 @@ data class RowDisplay(
     val showDivider: Boolean,
     val numberNorm: String,
     val compact: Boolean = false,
-    val hasIcon: Boolean = false
+    val hasIcon: Boolean = false,
+    // Resolved tint color for the type icon, used by compact rows
+    // to back the icon with a soft chip (v1.2.0). 0 means no chip.
+    val typeTint: Int = 0
 ) {
+    /**
+     * Selection state for the person timeline's multi select
+     * (v1.2.0). A body property, flipped by the activity when the
+     * selection changes; the next bind draws the tint and the
+     * check badge. Not part of equality: two displays with the
+     * same content are the same row either way.
+     */
+    var selected: Boolean = false
     /** Prebuilt text layouts for [layoutsWidthPx], set by RowLayoutFactory. */
     var titleLayout: StaticLayout? = null
     var subLayout: StaticLayout? = null
@@ -87,8 +98,24 @@ class RowView(context: Context) : View(context) {
     private val textColor: Int = UiKit.c(context, R.color.text)
     private val mutedColor: Int = UiKit.c(context, R.color.muted)
     private val borderColor: Int = UiKit.c(context, R.color.border)
+    private val cardColor: Int = UiKit.c(context, R.color.card)
+    private val primaryColor: Int = UiKit.c(context, R.color.primary)
 
     private val avatarPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.FILL }
+    // Selection tint and chip paints (v1.2.0): flat precomputed
+    // colors, no per draw allocation, same discipline as the rest.
+    private val selectionPaint = Paint().apply {
+        color = UiKit.blendOver(UiKit.c(context, R.color.bg), primaryColor, 0.14f)
+        style = Paint.Style.FILL
+    }
+    private val chipPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.FILL }
+    private val checkPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE
+        strokeCap = Paint.Cap.ROUND
+        strokeJoin = Paint.Join.ROUND
+        color = 0xFFFFFFFF.toInt()
+    }
+    private val checkPath = android.graphics.Path()
     private val initialsPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         typeface = UiKit.mediumTypeface
         textAlign = Paint.Align.CENTER
@@ -167,11 +194,27 @@ class RowView(context: Context) : View(context) {
         val cy = height / 2f
         val textStart = if (d.compact) dp(30f) else dp(82f)
 
-        // Left: avatar circle with initials, or (compact) the type icon.
+        // Selection (v1.2.0): a flat primary tint under everything.
+        if (d.selected) {
+            canvas.drawRect(0f, 0f, w, height.toFloat(), selectionPaint)
+        }
+
+        // Left: avatar circle with initials, or (compact) the type
+        // icon on its soft tinted chip.
         if (d.compact) {
             val bmp = icons[d.typeIcon]
             if (bmp != null) {
-                canvas.drawBitmap(bmp, 0f, cy - bmp.height / 2f, null)
+                if (d.typeTint != 0) {
+                    chipPaint.color = UiKit.blendOver(cardColor, d.typeTint, 0.16f)
+                    val half = dp(13f)
+                    canvas.drawRoundRect(
+                        0f, cy - half, dp(26f), cy + half,
+                        dp(8f), dp(8f), chipPaint
+                    )
+                    canvas.drawBitmap(bmp, dp(13f) - bmp.width / 2f, cy - bmp.height / 2f, null)
+                } else {
+                    canvas.drawBitmap(bmp, 0f, cy - bmp.height / 2f, null)
+                }
             }
         } else if (d.avatarInitials != null) {
             val cx = dp(44f)
@@ -218,9 +261,20 @@ class RowView(context: Context) : View(context) {
         // Right column: the prebuilt right aligned layout, its right
         // edge at the same 20dp inset. Normal rows center the two line
         // block like the old per line draws; compact rows center the
-        // single line on the row middle.
+        // single line on the row middle. A selected row trades the
+        // right column for the check badge (v1.2.0).
         val rightLayout = d.rightLayout
-        if (rightLayout != null) {
+        if (d.selected) {
+            val cx = w - dp(20f) - dp(11f)
+            avatarPaint.color = primaryColor
+            canvas.drawCircle(cx, cy, dp(11f), avatarPaint)
+            checkPaint.strokeWidth = dp(2f)
+            checkPath.reset()
+            checkPath.moveTo(cx - dp(4.5f), cy + dp(0.5f))
+            checkPath.lineTo(cx - dp(1.5f), cy + dp(3.8f))
+            checkPath.lineTo(cx + dp(5f), cy - dp(3.8f))
+            canvas.drawPath(checkPath, checkPaint)
+        } else if (rightLayout != null) {
             val rightTop = if (d.compact) {
                 cy - rightLayout.height / 2f
             } else {

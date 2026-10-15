@@ -9,8 +9,14 @@ import android.database.sqlite.SQLiteOpenHelper
  * The vault: this app's own unlimited SQLite store of call records.
  * There is no cap and no auto delete anywhere. Records are deduplicated
  * by the unique index on (number_norm, date_ms, type).
+ *
+ * Database v2 (app v1.2.0) adds the tombstones table: one row per
+ * manually deleted call, holding ONLY the SHA-256 of its dedupe key
+ * and the delete time. Sync, backup import and the watch folder
+ * merge all refuse tombstoned keys, so a manual delete is permanent
+ * on this device without the table revealing what was deleted.
  */
-class VaultDb(context: Context) : SQLiteOpenHelper(context, "vault.db", null, 1) {
+class VaultDb(context: Context) : SQLiteOpenHelper(context, "vault.db", null, 2) {
 
     override fun onCreate(db: SQLiteDatabase) {
         db.execSQL(
@@ -28,10 +34,14 @@ class VaultDb(context: Context) : SQLiteOpenHelper(context, "vault.db", null, 1)
         db.execSQL("CREATE UNIQUE INDEX idx_calls_dedupe ON calls(number_norm, date_ms, type)")
         db.execSQL("CREATE INDEX idx_calls_date ON calls(date_ms)")
         db.execSQL("CREATE INDEX idx_calls_number ON calls(number_norm)")
+        db.execSQL(CREATE_TOMBSTONES)
     }
 
     override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
-        // v1: nothing to upgrade yet.
+        if (oldVersion < 2) {
+            // v2: tombstones for manual deletes. No existing data changes.
+            db.execSQL(CREATE_TOMBSTONES)
+        }
     }
 
     /** Insert one record. Returns true when it was new, false when a duplicate. */
@@ -146,20 +156,68 @@ class VaultDb(context: Context) : SQLiteOpenHelper(context, "vault.db", null, 1)
         )
     }
 
-    /**
-     * Delete one record by its vault row id. Manual deletes from the
-     * person screen are the only deletes that exist anywhere in the
-     * app, and both are behind a confirmation dialog. Returns the
-     * number of rows removed (0 or 1).
-     */
-    fun deleteRecord(db: SQLiteDatabase, vaultId: Long): Int {
-        if (vaultId < 0) return 0
-        return db.delete("calls", "_id = ?", arrayOf(vaultId.toString()))
+    // ------------------------------------------------------- Tombstones
+
+    /** Every stored tombstone hash, for the acceptance checks. */
+    fun tombstoneHashes(db: SQLiteDatabase): HashSet<String> {
+        val set = HashSet<String>()
+        db.rawQuery("SELECT key_hash FROM tombstones", null).use { c ->
+            while (c.moveToNext()) set.add(c.getString(0))
+        }
+        return set
     }
 
-    /** Delete every record for one normalized number. Returns rows removed. */
-    fun deleteNumber(db: SQLiteDatabase, numberNorm: String): Int {
-        return db.delete("calls", "number_norm = ?", arrayOf(numberNorm))
+    /** How many tombstones exist. The table never says what they were. */
+    fun tombstoneCount(db: SQLiteDatabase): Long {
+        db.rawQuery("SELECT COUNT(*) FROM tombstones", null).use { c ->
+            return if (c.moveToFirst()) c.getLong(0) else 0L
+        }
+    }
+
+    /** Write one tombstone for [key]. Call inside a transaction. */
+    private fun addTombstone(db: SQLiteDatabase, key: String, deletedAtMs: Long) {
+        val cv = ContentValues()
+        cv.put("key_hash", VaultLogic.tombstoneHash(key))
+        cv.put("deleted_at", deletedAtMs)
+        db.insertWithOnConflict("tombstones", null, cv, SQLiteDatabase.CONFLICT_IGNORE)
+    }
+
+    /**
+     * Delete [records] from the vault and tombstone every one of
+     * their keys, in a single transaction: a delete and its
+     * tombstone land together or not at all. Manual deletes from
+     * the person screen are the only deletes that exist anywhere
+     * in the app, each behind the two flavor confirmation dialog.
+     * Returns the number of rows removed.
+     */
+    fun deleteEntries(
+        db: SQLiteDatabase,
+        records: List<VaultLogic.CallRecord>,
+        deletedAtMs: Long
+    ): Int {
+        var removed = 0
+        db.beginTransaction()
+        try {
+            for (r in records) {
+                addTombstone(db, VaultLogic.dedupeKey(r), deletedAtMs)
+                if (r.vaultId >= 0) {
+                    removed += db.delete("calls", "_id = ?", arrayOf(r.vaultId.toString()))
+                }
+            }
+            db.setTransactionSuccessful()
+        } finally {
+            db.endTransaction()
+        }
+        return removed
+    }
+
+    /** Delete every record for one normalized number, with tombstones. */
+    fun deleteNumberEntries(
+        db: SQLiteDatabase,
+        numberNorm: String,
+        deletedAtMs: Long
+    ): Int {
+        return deleteEntries(db, forNumber(db, numberNorm), deletedAtMs)
     }
 
     /** All records, newest first. */
@@ -195,6 +253,11 @@ class VaultDb(context: Context) : SQLiteOpenHelper(context, "vault.db", null, 1)
     }
 
     companion object {
+        private const val CREATE_TOMBSTONES =
+            "CREATE TABLE IF NOT EXISTS tombstones (" +
+                "key_hash TEXT PRIMARY KEY, " +
+                "deleted_at INTEGER NOT NULL)"
+
         @Volatile private var instance: VaultDb? = null
         fun get(context: Context): VaultDb {
             return instance ?: synchronized(this) {

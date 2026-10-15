@@ -124,6 +124,10 @@ object Backup {
         val helper = VaultDb.get(context)
         val db = helper.writableDatabase
         val existing = helper.allKeys(db)
+        // Tombstones (v1.2.0): a record the user deleted from the
+        // vault on purpose stays out, even when an old backup file
+        // still carries it.
+        val tombstones = helper.tombstoneHashes(db)
         var added = 0
         var skipped = 0
         db.beginTransaction()
@@ -131,6 +135,7 @@ object Backup {
             for (r in records) {
                 val key = VaultLogic.dedupeKey(r)
                 if (!existing.add(key)) { skipped++; continue }
+                if (VaultLogic.isTombstoned(key, tombstones)) { skipped++; continue }
                 if (helper.insertIgnore(db, r)) added++ else skipped++
             }
             db.setTransactionSuccessful()
@@ -456,7 +461,10 @@ object AutoBackup {
  *
  * Imports are additive only. Records arrive; deletions never
  * travel, so a manual delete on one device can never eat another
- * device's history. When the same call exists on both devices with
+ * device's history. The one exception is this device's own manual
+ * deletes: their tombstones (v1.2.0) are checked during the merge,
+ * so a call the user deleted HERE is not resurrected by the other
+ * device's copy either. When the same call exists on both devices with
  * different saved names, the later import's name wins
  * (VaultLogic.planWatchMerge). Auto restore to the phone call log
  * is a separate switch, default off.
@@ -769,7 +777,9 @@ object WatchFolder {
                 is Parsed.Ok -> {
                     val helper = VaultDb.get(context)
                     val db = helper.writableDatabase
-                    val plan = VaultLogic.planWatchMerge(helper.namesByKey(db), parsed.records)
+                    val plan = VaultLogic.planWatchMerge(
+                        helper.namesByKey(db), parsed.records, helper.tombstoneHashes(db)
+                    )
                     val addedRecords = ArrayList<VaultLogic.CallRecord>()
                     var namesUpdated = 0
                     db.beginTransaction()

@@ -314,15 +314,23 @@ object VaultLogic {
      * fingerprint; any rewrite, by this device or another, changes
      * it. Kept as one opaque string so the comparison stays trivial.
      */
-    fun zipFingerprint(fileSize: Long, entryBytes: ByteArray): String {
-        val digest = MessageDigest.getInstance("SHA-256").digest(entryBytes)
+    /** Lowercase hex SHA-256 of [bytes]. */
+    fun sha256Hex(bytes: ByteArray): String {
+        val digest = MessageDigest.getInstance("SHA-256").digest(bytes)
         val hex = StringBuilder(digest.size * 2)
         for (b in digest) {
             val v = b.toInt() and 0xFF
             hex.append("0123456789abcdef"[v shr 4])
             hex.append("0123456789abcdef"[v and 0x0F])
         }
-        return fileSize.toString() + ":" + hex.toString()
+        return hex.toString()
+    }
+
+    /** Lowercase hex SHA-256 of [text] as UTF-8. */
+    fun sha256Hex(text: String): String = sha256Hex(text.toByteArray(Charsets.UTF_8))
+
+    fun zipFingerprint(fileSize: Long, entryBytes: ByteArray): String {
+        return fileSize.toString() + ":" + sha256Hex(entryBytes)
     }
 
     /**
@@ -371,16 +379,23 @@ object VaultLogic {
      * incoming list itself resolve the same way, in file order:
      * the first occurrence inserts, a later one may rename it.
      * The caller's map is never mutated.
+     *
+     * A record whose key is tombstoned on this device (see
+     * [tombstoneHash]) is skipped entirely: no insert, no rename.
+     * A manual delete on this device wins over the other device's
+     * copy arriving again, exactly like it wins over a sync.
      */
     fun planWatchMerge(
         existingNames: Map<String, String>,
-        incoming: List<CallRecord>
+        incoming: List<CallRecord>,
+        tombstoneHashes: Set<String> = emptySet()
     ): MergePlan {
         val working = HashMap(existingNames)
         val inserts = ArrayList<CallRecord>()
         val updates = ArrayList<CallRecord>()
         for (r in incoming) {
             val key = dedupeKey(r)
+            if (isTombstoned(key, tombstoneHashes)) continue
             val current = working[key]
             if (current == null) {
                 inserts.add(r)
@@ -394,6 +409,82 @@ object VaultLogic {
             }
         }
         return MergePlan(inserts, updates)
+    }
+
+    // --------------------------------------- Tombstones (v1.2.0)
+
+    /**
+     * The stored form of a tombstone: the one way SHA-256 of a
+     * dedupe key. A manual delete writes one of these for every
+     * record it removes, and every path that can bring a record
+     * into the vault (system sync, backup import, watch folder
+     * merge) refuses a record whose key hashes to a stored value.
+     * The vault itself stores nothing readable about what was
+     * deleted, only the hash and the time. Because the key carries
+     * the call's exact date, a tombstone can never block a
+     * genuinely new call from the same number.
+     */
+    fun tombstoneHash(key: String): String = sha256Hex(key)
+
+    /** True when [key] hashes to one of the stored [tombstoneHashes]. */
+    fun isTombstoned(key: String, tombstoneHashes: Set<String>): Boolean =
+        tombstoneHashes.contains(tombstoneHash(key))
+
+    /**
+     * Whether an incoming record may enter the vault: its key is
+     * neither already saved nor tombstoned. A tombstoned key loses
+     * even when the vault no longer holds the record, which is the
+     * whole point: a manual delete wins over every later import,
+     * sync and merge.
+     */
+    fun shouldAcceptRecord(
+        key: String,
+        vaultKeys: Set<String>,
+        tombstoneHashes: Set<String>
+    ): Boolean = !vaultKeys.contains(key) && !isTombstoned(key, tombstoneHashes)
+
+    /** The records of [records] that [shouldAcceptRecord] lets in, in file order. */
+    fun filterAccepted(
+        records: List<CallRecord>,
+        vaultKeys: Set<String>,
+        tombstoneHashes: Set<String>
+    ): List<CallRecord> = records.filter { shouldAcceptRecord(dedupeKey(it), vaultKeys, tombstoneHashes) }
+
+    /**
+     * An exact delete against the phone's own call log for one
+     * record: the CallLog.Calls selection and its arguments,
+     * matching on the stored number column, the date and the type.
+     * The number argument is the normalized number, the identity
+     * the vault itself uses; a provider that stored the number in
+     * another format simply matches nothing here, and the caller
+     * falls back to comparing normalized numbers row by row.
+     */
+    data class ProviderDeleteSpec(val selection: String, val args: List<String>)
+
+    fun providerDeleteSpec(r: CallRecord): ProviderDeleteSpec = ProviderDeleteSpec(
+        selection = "number = ? AND date = ? AND type = ?",
+        args = listOf(r.numberNorm, r.dateMs.toString(), r.type.toString())
+    )
+
+    /**
+     * The result line after a manual delete: plain counts of what
+     * left the vault and, for the vault and phone log flavor, what
+     * left the phone log. [phoneRemoved] is null when the phone
+     * log was not touched (the vault only flavor).
+     */
+    fun deleteOutcomeText(vaultRemoved: Int, phoneRemoved: Int?): String {
+        val vault = if (vaultRemoved == 1) {
+            "Removed 1 entry from the vault."
+        } else {
+            "Removed " + vaultRemoved + " entries from the vault."
+        }
+        if (phoneRemoved == null) return vault
+        val phone = when (phoneRemoved) {
+            0 -> "No matching entries were in the phone log."
+            1 -> "Removed 1 entry from the phone log."
+            else -> "Removed " + phoneRemoved + " entries from the phone log."
+        }
+        return vault + " " + phone
     }
 
     /** The Status line text for the last watch check, without its time. */

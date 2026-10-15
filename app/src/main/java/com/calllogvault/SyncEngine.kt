@@ -1,6 +1,7 @@
 package com.calllogvault
 
 import android.content.ContentProviderOperation
+import android.content.ContentUris
 import android.content.ContentValues
 import android.content.Context
 import android.net.Uri
@@ -148,6 +149,11 @@ object SyncEngine {
                     return SyncResult(0, 0, 0, "System call log columns not available")
                 }
                 val seenKeys = HashSet<String>()
+                // Manual deletes leave tombstones (v1.2.0): a call
+                // the user deleted from the vault on purpose must
+                // never be copied straight back in by this scan,
+                // even while it still sits in the phone's own log.
+                val tombstones = helper.tombstoneHashes(db)
                 // Speed: one transaction wraps every insert below (VaultDb
                 // uses insertWithOnConflict with CONFLICT_IGNORE), and
                 // contact lookups are cached per normalized number for the
@@ -165,6 +171,7 @@ object SyncEngine {
                         val key = VaultLogic.dedupeKey(norm, date, type)
                         seen++
                         if (!seenKeys.add(key)) { skipped++; continue }
+                        if (VaultLogic.isTombstoned(key, tombstones)) { skipped++; continue }
                         var name = if (iName >= 0) c.getString(iName) ?: "" else ""
                         if (VaultLogic.isUnknownName(name)) {
                             val looked = nameCache[norm] ?: lookupContactName(context, number)
@@ -208,6 +215,67 @@ object SyncEngine {
         } catch (e: Exception) {
             return SyncResult(added, skipped, seen, e.message ?: "Sync failed")
         }
+    }
+
+    /**
+     * Delete [records] from the phone's own call log (the "vault
+     * and phone log" delete flavor, v1.2.0). Each record is first
+     * deleted with the exact selection from
+     * [VaultLogic.providerDeleteSpec] (normalized number, date,
+     * type). A provider that stored the number in another format
+     * matches nothing there, so a record that deleted zero rows
+     * gets one fallback pass: rows at the same date are read back,
+     * their numbers normalized and compared in code, and matches
+     * are deleted by row id. Returns the number of phone log rows
+     * removed; a record already gone from the log simply adds 0.
+     * Blocking, background thread only.
+     */
+    fun deleteFromPhoneLog(context: Context, records: List<VaultLogic.CallRecord>): Int {
+        var removed = 0
+        for (r in records) {
+            try {
+                val spec = VaultLogic.providerDeleteSpec(r)
+                var n = context.contentResolver.delete(
+                    CallLog.Calls.CONTENT_URI, spec.selection, spec.args.toTypedArray()
+                )
+                if (n == 0) n = deleteFromPhoneLogByScan(context, r)
+                removed += n
+            } catch (e: Exception) {
+                // A failed row never sinks the rest of the delete.
+            }
+        }
+        return removed
+    }
+
+    /** The format tolerant fallback for [deleteFromPhoneLog]. */
+    private fun deleteFromPhoneLogByScan(context: Context, r: VaultLogic.CallRecord): Int {
+        var removed = 0
+        try {
+            val ids = ArrayList<Long>()
+            context.contentResolver.query(
+                CallLog.Calls.CONTENT_URI,
+                arrayOf(CallLog.Calls._ID, CallLog.Calls.NUMBER, CallLog.Calls.TYPE),
+                CallLog.Calls.DATE + " = ?",
+                arrayOf(r.dateMs.toString()),
+                null
+            )?.use { c ->
+                while (c.moveToNext()) {
+                    if (c.getInt(2) != r.type) continue
+                    val number = c.getString(1) ?: continue
+                    if (VaultLogic.normalizeNumber(number) == r.numberNorm) {
+                        ids.add(c.getLong(0))
+                    }
+                }
+            }
+            for (id in ids) {
+                removed += context.contentResolver.delete(
+                    ContentUris.withAppendedId(CallLog.Calls.CONTENT_URI, id), null, null
+                )
+            }
+        } catch (e: Exception) {
+            // Counted as zero for this record by the caller.
+        }
+        return removed
     }
 
     /** How many entries the system call log currently holds, or -1 when unreadable. */

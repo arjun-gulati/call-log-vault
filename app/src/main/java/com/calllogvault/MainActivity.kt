@@ -3,8 +3,6 @@ package com.calllogvault
 import android.animation.AnimatorListenerAdapter
 import android.animation.ObjectAnimator
 import android.app.Activity
-import android.app.AlertDialog
-import android.app.ProgressDialog
 import android.content.Context
 import android.content.Intent
 import android.content.res.Resources
@@ -30,7 +28,6 @@ import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.ListView
 import android.widget.ScrollView
-import android.widget.Switch
 import android.widget.TextView
 import android.widget.Toast
 import java.text.SimpleDateFormat
@@ -89,8 +86,8 @@ class MainActivity : Activity() {
     private lateinit var statAuto: TextView
     private var autoSubtitle: TextView? = null
     private var scheduleSubtitle: TextView? = null
-    private var watchSwitch: Switch? = null
-    private var autoRestoreSwitch: Switch? = null
+    private var watchToggle: ToggleView? = null
+    private var autoRestoreToggle: ToggleView? = null
     private var autoRestoreRowView: LinearLayout? = null
 
     private var allRecords: List<VaultLogic.CallRecord> = emptyList()
@@ -640,9 +637,14 @@ class MainActivity : Activity() {
                 layoutParams = LinearLayout.LayoutParams(
                     0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
                 if (selected) {
+                    // Filled pill (v1.2.0): the primary blended over
+                    // the card color at a flat tint, full strength
+                    // primary border, no shadow.
                     background = GradientDrawable().apply {
                         cornerRadius = dp(16).toFloat()
-                        setColor(color(R.color.pill_sel_bg))
+                        setColor(
+                            UiKit.blendOver(color(R.color.card), color(R.color.primary), 0.18f)
+                        )
                         setStroke(dp(1), color(R.color.pill_sel_border))
                     }
                     setTextColor(color(R.color.pill_sel_text))
@@ -677,7 +679,7 @@ class MainActivity : Activity() {
      * switch too.
      */
     private fun amoledSwitchRow(): LinearLayout {
-        val toggle = Switch(this)
+        val toggle = ToggleView(this)
         val row = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
@@ -703,24 +705,25 @@ class MainActivity : Activity() {
                 0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f
             ).apply { marginStart = dp(16) }
         })
-        toggle.isChecked = UiKit.amoledForDark(this)
-        toggle.setOnCheckedChangeListener { _, checked ->
+        toggle.setChecked(UiKit.amoledForDark(this), animate = false)
+        toggle.onCheckedChange = { checked ->
             if (UiKit.amoledForDark(this@MainActivity) != checked) {
                 UiKit.setAmoledForDark(this@MainActivity, checked)
                 recreate()
             }
         }
         row.addView(toggle)
-        row.setOnClickListener { toggle.isChecked = !toggle.isChecked }
+        row.setOnClickListener { toggle.toggle() }
         return row
     }
 
     /**
      * A drawer switch row in the same shape as the AMOLED switch:
-     * icon tile, a title with a short subtitle under it, and a
-     * framework Switch at the end. Tapping the row flips the
-     * switch, like the AMOLED row. The checked state is set before
-     * the listener is attached, so building the row never fires it.
+     * icon tile, a title with a short subtitle under it, and the
+     * app's own ToggleView at the end (the framework Switch is gone
+     * everywhere since v1.2.0). Tapping the row flips the toggle,
+     * like the AMOLED row. The checked state is set before the
+     * listener is attached, so building the row never fires it.
      */
     private fun switchRow(
         icon: Int,
@@ -728,8 +731,8 @@ class MainActivity : Activity() {
         subtitle: String,
         checked: Boolean,
         onFlip: (Boolean) -> Unit
-    ): Pair<LinearLayout, Switch> {
-        val toggle = Switch(this)
+    ): Pair<LinearLayout, ToggleView> {
+        val toggle = ToggleView(this)
         val row = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
@@ -764,10 +767,10 @@ class MainActivity : Activity() {
                 setTextColor(color(R.color.muted))
             })
         })
-        toggle.isChecked = checked
-        toggle.setOnCheckedChangeListener { _, isChecked -> onFlip(isChecked) }
+        toggle.setChecked(checked, animate = false)
+        toggle.onCheckedChange = { isChecked -> onFlip(isChecked) }
         row.addView(toggle)
-        row.setOnClickListener { toggle.isChecked = !toggle.isChecked }
+        row.setOnClickListener { toggle.toggle() }
         return row to toggle
     }
 
@@ -791,7 +794,7 @@ class MainActivity : Activity() {
                 if (checked) refresh(silent = true)
             }
         }
-        watchSwitch = toggle
+        watchToggle = toggle
         return row
     }
 
@@ -814,11 +817,11 @@ class MainActivity : Activity() {
                 WatchFolder.setAutoRestore(this@MainActivity, checked)
             }
         }
-        autoRestoreSwitch = toggle
+        autoRestoreToggle = toggle
         autoRestoreRowView = row
         row.setOnClickListener {
             if (WatchFolder.watchEnabled(this@MainActivity) && AutoBackup.hasFolder(this@MainActivity)) {
-                toggle.isChecked = !toggle.isChecked
+                toggle.toggle()
             }
         }
         return row
@@ -828,7 +831,7 @@ class MainActivity : Activity() {
     private fun updateWatchRows() {
         val canRestore = WatchFolder.watchEnabled(this) && AutoBackup.hasFolder(this)
         autoRestoreRowView?.alpha = if (canRestore) 1f else 0.45f
-        autoRestoreSwitch?.isEnabled = canRestore
+        autoRestoreToggle?.isEnabled = canRestore
     }
 
     private fun drawerHeader(): LinearLayout = LinearLayout(this).apply {
@@ -876,6 +879,7 @@ class MainActivity : Activity() {
             background = GradientDrawable().apply {
                 cornerRadius = dp(16).toFloat()
                 setColor(color(R.color.surface))
+                setStroke(dp(1), color(R.color.border))
             }
             setPadding(dp(16), dp(12), dp(16), dp(12))
             layoutParams = LinearLayout.LayoutParams(
@@ -981,6 +985,7 @@ class MainActivity : Activity() {
             background = GradientDrawable().apply {
                 cornerRadius = dp(16).toFloat()
                 setColor(color(R.color.bg))
+                setStroke(dp(1), color(R.color.border))
             }
             setPadding(dp(16), dp(14), dp(16), dp(14))
             layoutParams = LinearLayout.LayoutParams(
@@ -1108,10 +1113,12 @@ class MainActivity : Activity() {
     }
 
     /**
-     * Single choice dialog for the backup schedule (v1.0.8). Smart
-     * is the original throttle and stays the default; the others are
-     * plainer promises about how often the rolling file is rewritten.
-     * The choice takes effect on the next scheduled auto backup run.
+     * Single choice dialog for the backup schedule (v1.0.8), in the
+     * custom dialog since v1.2.0: radio rows with the current
+     * schedule filled. Smart is the original throttle and stays the
+     * default; the others are plainer promises about how often the
+     * rolling file is rewritten. The choice takes effect on the
+     * next scheduled auto backup run.
      */
     private fun showBackupScheduleDialog() {
         val schedules = listOf(
@@ -1120,22 +1127,17 @@ class MainActivity : Activity() {
             VaultLogic.BACKUP_SCHEDULE_EVERY_6H,
             VaultLogic.BACKUP_SCHEDULE_DAILY
         )
-        val labels = arrayOf(
+        val labels = listOf(
             "Smart (recommended)",
             VaultLogic.backupScheduleName(VaultLogic.BACKUP_SCHEDULE_EVERY_CALL),
             VaultLogic.backupScheduleName(VaultLogic.BACKUP_SCHEDULE_EVERY_6H),
             VaultLogic.backupScheduleName(VaultLogic.BACKUP_SCHEDULE_DAILY)
         )
         val current = schedules.indexOf(AutoBackup.schedule(this)).coerceAtLeast(0)
-        AlertDialog.Builder(this)
-            .setTitle("Backup schedule")
-            .setSingleChoiceItems(labels, current) { dialog, which ->
-                AutoBackup.setSchedule(this, schedules[which])
-                updateScheduleRow()
-                dialog.dismiss()
-            }
-            .setNegativeButton("Cancel", null)
-            .show()
+        VaultDialog.singleChoice(this, "Backup schedule", labels, current) { which ->
+            AutoBackup.setSchedule(this, schedules[which])
+            updateScheduleRow()
+        }
     }
 
     private fun autoBackupStatText(): String {
@@ -1199,18 +1201,16 @@ class MainActivity : Activity() {
     // ---------------------------------------------------------- Permissions
 
     private fun explainAndRequestPermissions() {
-        AlertDialog.Builder(this)
-            .setTitle("Call log permission")
-            .setMessage(
-                "Call Log Vault copies each new call into its own list on this phone, " +
-                    "so calls stay saved after the phone trims its own list. " +
-                    "No data leaves the phone. You can remove the permission any time in Settings."
-            )
-            .setPositiveButton("Continue") { _, _ ->
-                requestPermissions(PermUtil.missing(this), REQ_PERMISSIONS)
-            }
-            .setNegativeButton("Not now", null)
-            .show()
+        VaultDialog.message(
+            this,
+            "Call log permission",
+            "Call Log Vault copies each new call into its own list on this phone, " +
+                "so calls stay saved after the phone trims its own list. " +
+                "No data leaves the phone. You can remove the permission any time in Settings.",
+            positiveLabel = "Continue",
+            onPositive = { requestPermissions(PermUtil.missing(this), REQ_PERMISSIONS) },
+            negativeLabel = "Not now"
+        )
     }
 
     override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
@@ -1615,15 +1615,15 @@ class MainActivity : Activity() {
             toast("Nothing to back up yet")
             return
         }
-        AlertDialog.Builder(this)
-            .setTitle("Backup to ZIP")
-            .setMessage(
-                "The backup file is saved in the folder you pick next, outside this app. " +
-                    "Clearing app data or uninstalling the app will not delete it."
-            )
-            .setPositiveButton("Choose folder") { _, _ -> launchExport() }
-            .setNegativeButton("Cancel", null)
-            .show()
+        VaultDialog.message(
+            this,
+            "Backup to ZIP",
+            "The backup file is saved in the folder you pick next, outside this app. " +
+                "Clearing app data or uninstalling the app will not delete it.",
+            positiveLabel = "Choose folder",
+            onPositive = { launchExport() },
+            negativeLabel = "Cancel"
+        )
     }
 
     private fun launchExport() {
@@ -1717,12 +1717,14 @@ class MainActivity : Activity() {
                                     result.skipped + " that were already saved."
                             )
                             refresh(silent = true)
-                            AlertDialog.Builder(this)
-                                .setTitle("Put calls back in the dialer?")
-                                .setMessage("The calls are in the vault now. You can also put them back into the phone call list, so your dialer shows them.")
-                                .setPositiveButton("Restore to Dialer") { _, _ -> chooseRestoreMode() }
-                                .setNegativeButton("Later", null)
-                                .show()
+                            VaultDialog.message(
+                                this,
+                                "Put calls back in the dialer?",
+                                "The calls are in the vault now. You can also put them back into the phone call list, so your dialer shows them.",
+                                positiveLabel = "Restore to Dialer",
+                                onPositive = { chooseRestoreMode() },
+                                negativeLabel = "Later"
+                            )
                         }
                     }
                 }
@@ -1743,27 +1745,28 @@ class MainActivity : Activity() {
             toast("Nothing saved yet")
             return
         }
-        AlertDialog.Builder(this)
-            .setTitle("Restore to Dialer")
-            .setItems(arrayOf("Latest 2000 calls", "All calls (" + total + ")")) { _, which ->
-                if (which == 0) {
-                    doRestore(latestOnly = true)
-                } else {
-                    AlertDialog.Builder(this)
-                        .setTitle("Restore all calls")
-                        .setMessage(
-                            "Your phone keeps only the newest 2000 entries in its call list. " +
-                                "If you restore more than that, the phone will trim the oldest ones " +
-                                "from the dialer again as new calls arrive. Nothing is lost: " +
-                                "every call stays in this vault, with no limit."
-                        )
-                        .setPositiveButton("Restore all") { _, _ -> doRestore(latestOnly = false) }
-                        .setNegativeButton("Cancel", null)
-                        .show()
-                }
+        VaultDialog.singleChoice(
+            this,
+            "Restore to Dialer",
+            listOf("Latest 2000 calls", "All calls (" + total + ")"),
+            selectedIndex = -1
+        ) { which ->
+            if (which == 0) {
+                doRestore(latestOnly = true)
+            } else {
+                VaultDialog.message(
+                    this,
+                    "Restore all calls",
+                    "Your phone keeps only the newest 2000 entries in its call list. " +
+                        "If you restore more than that, the phone will trim the oldest ones " +
+                        "from the dialer again as new calls arrive. Nothing is lost: " +
+                        "every call stays in this vault, with no limit.",
+                    positiveLabel = "Restore all",
+                    onPositive = { doRestore(latestOnly = false) },
+                    negativeLabel = "Cancel"
+                )
             }
-            .setNegativeButton("Cancel", null)
-            .show()
+        }
     }
 
     private fun doRestore(latestOnly: Boolean) {
@@ -1794,41 +1797,102 @@ class MainActivity : Activity() {
 
     // -------------------------------------------------------------- Dialogs
 
+    /**
+     * One Status card (v1.2.0): an eyebrow title over label and
+     * value rows, on the shared card surface. The Status popup is
+     * grouped cards like this (Vault, Backup, Appearance, Watch,
+     * About) instead of the old single block of plain text lines.
+     */
+    private fun infoCard(title: String, rows: List<Pair<String, String>>): LinearLayout {
+        val card = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            background = UiKit.cardBackground(this@MainActivity, 16)
+            setPadding(dp(16), dp(12), dp(16), dp(12))
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply { bottomMargin = dp(12) }
+        }
+        card.addView(TextView(this).apply {
+            text = title.uppercase(Locale.ENGLISH)
+            textSize = 11f
+            letterSpacing = 0.18f
+            setTypeface(typeface, Typeface.BOLD)
+            setTextColor(color(R.color.eyebrow))
+            setPadding(0, 0, 0, dp(4))
+        })
+        for ((label, value) in rows) {
+            val row = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                setPadding(0, dp(5), 0, dp(5))
+            }
+            row.addView(TextView(this).apply {
+                text = label
+                textSize = 13f
+                setTextColor(color(R.color.muted))
+                layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+            })
+            row.addView(TextView(this).apply {
+                text = value
+                textSize = 13f
+                typeface = UiKit.mediumTypeface
+                setTextColor(color(R.color.text))
+                gravity = Gravity.END
+                layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1.4f)
+            })
+            card.addView(row)
+        }
+        return card
+    }
+
     private fun showInfo() {
         val helper = VaultDb.get(this)
         val db = helper.readableDatabase
         val count = helper.count(db)
         val oldest = helper.oldestDate(db)
         val lastSync = SyncEngine.lastSyncMs(this)
-        val sb = StringBuilder()
-        sb.append("Version: ").append(versionName()).append('\n')
-        sb.append("Calls in vault: ").append(count).append('\n')
-        if (oldest > 0) sb.append("Oldest saved: ").append(VaultLogic.formatDateTime(oldest)).append('\n')
-        if (lastSync > 0) {
-            sb.append("Last sync: ").append(VaultLogic.formatDateTime(lastSync))
-                .append(" (added ").append(SyncEngine.lastSyncAdded(this)).append(")\n")
-        } else {
-            sb.append("Last sync: not yet\n")
-        }
-        sb.append("Auto save on new call: ")
-            .append(if (SnifferScheduler.isTriggerScheduled(this)) "scheduled" else "not scheduled, open the app to rearm it")
-            .append('\n')
-        sb.append("Daily safety sync: ")
-            .append(if (SnifferScheduler.isPeriodicScheduled(this)) "scheduled" else "not scheduled")
-            .append('\n')
-        sb.append("Auto backup folder: ")
-            .append(if (AutoBackup.hasFolder(this)) AutoBackup.folderDisplayName(this) else "not set")
-            .append('\n')
+        val syncError = SyncEngine.lastSyncError(this)
+
+        val vaultRows = listOf(
+            "Calls in vault" to count.toString(),
+            "Oldest saved" to
+                if (oldest > 0) VaultLogic.formatDateTime(oldest) else "None yet",
+            "Last sync" to
+                if (lastSync > 0) {
+                    VaultLogic.formatDateTime(lastSync) +
+                        " (added " + SyncEngine.lastSyncAdded(this) + ")"
+                } else {
+                    "Not yet"
+                },
+            "Last sync result" to when {
+                syncError.isNotEmpty() -> syncError
+                lastSync > 0 -> "No error (added " + SyncEngine.lastSyncAdded(this) + ")"
+                else -> "No error"
+            }
+        )
+        val backupRows = ArrayList<Pair<String, String>>()
+        backupRows.add(
+            "Auto backup folder" to
+                if (AutoBackup.hasFolder(this)) AutoBackup.folderDisplayName(this) else "Not set"
+        )
+        backupRows.add(
+            "Backup schedule" to VaultLogic.backupScheduleName(AutoBackup.schedule(this))
+        )
         if (AutoBackup.hasFolder(this)) {
-            val ms = AutoBackup.lastWriteMs(this)
-            sb.append("Last auto backup: ")
-                .append(if (ms > 0) VaultLogic.formatDateTime(ms) else "not yet")
-                .append('\n')
-            if (AutoBackup.hasError(this)) sb.append("Auto backup status: needs attention\n")
-        }
-        if (WatchFolder.watchEnabled(this)) {
-            sb.append(WatchFolder.statusLine(this) ?: "Watch folder: not checked yet")
-                .append('\n')
+            val autoMs = AutoBackup.lastWriteMs(this)
+            backupRows.add(
+                "Last auto backup" to
+                    if (autoMs > 0) {
+                        VaultLogic.formatDateTime(autoMs) + ", " +
+                            AutoBackup.lastCount(this) + " records"
+                    } else {
+                        "Not yet"
+                    }
+            )
+            backupRows.add(
+                "Auto backup status" to
+                    if (AutoBackup.hasError(this)) "Needs attention" else "Ok"
+            )
         }
         val appearanceMode = UiKit.appearance(this)
         val appearanceText = if (appearanceMode == UiKit.APPEARANCE_AUTO) {
@@ -1841,58 +1905,64 @@ class MainActivity : Activity() {
             // mode with the AMOLED switch on reads AMOLED here.
             UiKit.appearanceName(UiKit.concreteAppearance(this))
         }
-        sb.append("Appearance: ").append(appearanceText).append('\n')
-        sb.append("\nDiagnostics\n")
-        sb.append("Vault entries in database: ").append(count).append('\n')
-        sb.append("Last sync time: ")
-            .append(if (lastSync > 0) VaultLogic.formatDateTime(lastSync) else "not yet")
-            .append('\n')
-        val syncError = SyncEngine.lastSyncError(this)
-        sb.append("Last sync result: ").append(
-            when {
-                syncError.isNotEmpty() -> syncError
-                lastSync > 0 -> "No error (added " + SyncEngine.lastSyncAdded(this) + ")"
-                else -> "No error"
+        val aboutRows = listOf(
+            "Version" to versionName(),
+            "Auto save on new call" to
+                if (SnifferScheduler.isTriggerScheduled(this)) {
+                    "Scheduled"
+                } else {
+                    "Not scheduled, open the app to rearm it"
+                },
+            "Daily safety sync" to
+                if (SnifferScheduler.isPeriodicScheduled(this)) "Scheduled" else "Not scheduled"
+        )
+
+        val content = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        content.addView(infoCard("Vault", vaultRows))
+        content.addView(infoCard("Backup", backupRows))
+        content.addView(infoCard("Appearance", listOf("Appearance" to appearanceText)))
+        if (WatchFolder.watchEnabled(this)) {
+            val line = WatchFolder.statusLine(this)
+            val watchText = if (line == null) {
+                "Not checked yet"
+            } else {
+                line.removePrefix("Watch folder: ")
+                    .replaceFirstChar { it.uppercaseChar() }
             }
-        ).append('\n')
-        sb.append("Auto backup folder: ")
-            .append(
-                if (AutoBackup.hasFolder(this)) "set (" + AutoBackup.folderDisplayName(this) + ")"
-                else "not set"
-            )
-            .append('\n')
-        if (AutoBackup.hasFolder(this)) {
-            val autoMs = AutoBackup.lastWriteMs(this)
-            sb.append("Last auto backup: ")
-                .append(
-                    if (autoMs > 0) {
-                        VaultLogic.formatDateTime(autoMs) + ", " + AutoBackup.lastCount(this) + " records"
-                    } else {
-                        "not yet"
-                    }
-                )
-                .append('\n')
-            sb.append("Auto backup status: ")
-                .append(if (AutoBackup.hasError(this)) "needs attention" else "ok")
-                .append('\n')
+            content.addView(infoCard("Watch", listOf("Last check" to watchText)))
         }
-        sb.append("The vault has no limit and never deletes calls.\n")
-        sb.append("Backup files live in folders you choose, outside this app, " +
-            "so clearing data or uninstalling never deletes them.\n")
-        sb.append("This app works fully offline and has no internet permission.\n")
+        val aboutCard = infoCard("About", aboutRows)
+        aboutCard.addView(TextView(this).apply {
+            text = "The vault has no limit and never deletes calls on its own.\n" +
+                "Backup files live in folders you choose, outside this app, " +
+                "so clearing data or uninstalling never deletes them.\n" +
+                "This app works fully offline and has no internet permission.\n\n" +
+                "Imagined by Arjun"
+            textSize = 13f
+            setTextColor(color(R.color.muted))
+            setPadding(0, dp(8), 0, dp(2))
+        })
         val crashSummary = CrashLog.summary(this)
         if (crashSummary != null) {
-            sb.append("\nLast crash\n").append(crashSummary).append('\n')
+            aboutCard.addView(TextView(this).apply {
+                text = "Last crash: " + crashSummary + "  (tap to view)"
+                textSize = 13f
+                setTextColor(color(R.color.primary))
+                setPadding(0, dp(8), 0, dp(2))
+                isClickable = true
+                pressFeedback()
+                setOnClickListener { showCrashDetail() }
+            })
         }
-        sb.append("\nImagined by Arjun")
-        val builder = AlertDialog.Builder(this)
-            .setTitle("Status and about")
-            .setMessage(sb.toString())
-            .setPositiveButton("OK", null)
-        if (crashSummary != null) {
-            builder.setNegativeButton("View crash") { _, _ -> showCrashDetail() }
-        }
-        builder.show()
+        content.addView(aboutCard)
+
+        val scroll = ScrollView(this)
+        scroll.addView(content)
+        scroll.layoutParams = LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT,
+            (resources.displayMetrics.heightPixels * 0.55f).toInt()
+        )
+        VaultDialog.custom(this, "Status and about", scroll)
     }
 
     private fun showCrashDetail() {
@@ -1902,19 +1972,22 @@ class MainActivity : Activity() {
             textSize = 11f
             setTextColor(color(R.color.text))
             typeface = Typeface.MONOSPACE
-            setPadding(dp(20), dp(12), dp(20), dp(12))
+            setPadding(dp(4), dp(4), dp(4), dp(4))
         }
         val scroll = ScrollView(this)
         scroll.addView(tv)
-        AlertDialog.Builder(this)
-            .setTitle("Last crash")
-            .setView(scroll)
-            .setPositiveButton("OK", null)
-            .setNegativeButton("Clear crash log") { _, _ ->
+        scroll.layoutParams = LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT,
+            (resources.displayMetrics.heightPixels * 0.5f).toInt()
+        )
+        VaultDialog.custom(
+            this, "Last crash", scroll,
+            negativeLabel = "Clear crash log",
+            onNegative = {
                 CrashLog.clear(this)
                 toast("Crash log cleared")
             }
-            .show()
+        )
     }
 
     private fun versionName(): String = try {
@@ -1923,20 +1996,10 @@ class MainActivity : Activity() {
         "1.0.6"
     }
 
-    private fun showProgress(msg: String): ProgressDialog {
-        val p = ProgressDialog(this)
-        p.setMessage(msg)
-        p.setCancelable(false)
-        p.show()
-        return p
-    }
+    private fun showProgress(msg: String): VaultProgress = VaultDialog.progress(this, msg)
 
     private fun showResult(title: String, msg: String) {
-        AlertDialog.Builder(this)
-            .setTitle(title)
-            .setMessage(msg)
-            .setPositiveButton("OK", null)
-            .show()
+        VaultDialog.message(this, title, msg)
     }
 
     private fun toast(msg: String) {

@@ -1,8 +1,6 @@
 package com.calllogvault
 
 import android.app.Activity
-import android.app.AlertDialog
-import android.app.ProgressDialog
 import android.content.Context
 import android.content.Intent
 import android.content.res.Resources
@@ -22,10 +20,12 @@ import android.widget.Toast
 
 /**
  * Full vault timeline for one number, with call and restore actions.
- * Also the only place anything can be deleted: a long press on one
- * timeline entry, or the delete all action, each behind a
- * confirmation dialog, each removing vault records only. The
- * phone's own call log is never touched by a delete.
+ * Also the only place anything can be deleted: a long press enters
+ * multi select on the timeline (v1.2.0), and the delete all action
+ * sits under the pills. Every delete runs through the two flavor
+ * confirmation: vault only, or vault and phone log. Both flavors
+ * tombstone the deleted keys, so nothing deleted here ever comes
+ * back through a sync, an old backup or the watch folder.
  */
 class PersonActivity : Activity() {
 
@@ -50,6 +50,15 @@ class PersonActivity : Activity() {
     private var records: List<VaultLogic.CallRecord> = emptyList()
     private var numberNorm: String = ""
     private var timelineDisplays: List<RowDisplay> = emptyList()
+
+    // Multi select state (v1.2.0). Positions index into [records]
+    // and [timelineDisplays], which are always built together.
+    private var selecting = false
+    private val selectedPositions = HashSet<Int>()
+    private var timelineList: ListView? = null
+    private var timelineAdapter: BaseAdapter? = null
+    private var selectionBar: LinearLayout? = null
+    private var selectionCount: TextView? = null
 
     /** Type icons rendered once into tinted bitmaps for the timeline rows. */
     private val iconBitmaps: Map<Int, android.graphics.Bitmap> by lazy {
@@ -89,7 +98,25 @@ class PersonActivity : Activity() {
         buildUi()
     }
 
+    override fun onBackPressed() {
+        // Back leaves selection mode first, the standard pattern.
+        if (selecting) {
+            exitSelection()
+            return
+        }
+        super.onBackPressed()
+    }
+
     private fun buildUi() {
+        // Every rebuild starts out of selection mode: the displays
+        // are new objects, so stale selection flags would lie.
+        selecting = false
+        selectedPositions.clear()
+        timelineList = null
+        timelineAdapter = null
+        selectionBar = null
+        selectionCount = null
+
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setBackgroundColor(color(R.color.bg))
@@ -107,6 +134,7 @@ class PersonActivity : Activity() {
             setOnClickListener { finish() }
         }
         root.addView(back)
+        root.addView(buildSelectionBar())
 
         val latest = records.first()
         val named = records.firstOrNull { !VaultLogic.isUnknownName(it.name) }
@@ -195,6 +223,7 @@ class PersonActivity : Activity() {
                 cornerRadius = dp(24).toFloat()
                 setColor(color(R.color.primary))
             }
+            pressFeedback()
             setOnClickListener {
                 val intent = Intent(Intent.ACTION_DIAL, Uri.parse("tel:" + Uri.encode(latest.numberRaw)))
                 startActivity(intent)
@@ -211,6 +240,7 @@ class PersonActivity : Activity() {
                 setColor(color(R.color.pill_unsel_bg))
                 setStroke(dp(1), color(R.color.pill_unsel_border))
             }
+            pressFeedback()
             setOnClickListener { restoreThisNumber() }
         }
         row.addView(restoreBtn, LinearLayout.LayoutParams(0, dp(48), 1f).apply { marginStart = dp(6) })
@@ -261,11 +291,24 @@ class PersonActivity : Activity() {
                 typeIcon = r.type,
                 showDivider = i < records.size - 1,
                 numberNorm = numberNorm,
-                compact = true
+                compact = true,
+                typeTint = color(typeTintRes(r.type))
             )
             rowLayoutFactory.buildInto(display, listWidthPx)
             display
         }
+        val timelineAdapterLocal = object : BaseAdapter() {
+            override fun getCount(): Int = timelineDisplays.size
+            override fun getItem(position: Int): Any = timelineDisplays[position]
+            override fun getItemId(position: Int): Long = position.toLong()
+            override fun getView(position: Int, convertView: View?, parent: ViewGroup): View {
+                val rv = if (convertView is RowView) convertView else RowView(this@PersonActivity)
+                rv.layoutFactory = rowLayoutFactory
+                rv.setItem(timelineDisplays[position], iconBitmaps)
+                return rv
+            }
+        }
+        timelineAdapter = timelineAdapterLocal
         val listView = ListView(this).apply {
             divider = null
             isScrollingCacheEnabled = false
@@ -273,87 +316,196 @@ class PersonActivity : Activity() {
             // Same pressed highlight as the main list (v1.0.5): the
             // selector, not per row ripple backgrounds.
             selector = UiKit.rowSelector(this@PersonActivity)
-            adapter = object : BaseAdapter() {
-                override fun getCount(): Int = timelineDisplays.size
-                override fun getItem(position: Int): Any = timelineDisplays[position]
-                override fun getItemId(position: Int): Long = position.toLong()
-                override fun getView(position: Int, convertView: View?, parent: ViewGroup): View {
-                    val rv = if (convertView is RowView) convertView else RowView(this@PersonActivity)
-                    rv.layoutFactory = rowLayoutFactory
-                    rv.setItem(timelineDisplays[position], iconBitmaps)
-                    return rv
-                }
-            }
+            adapter = timelineAdapterLocal
         }
-        // Long press one entry to delete just that entry from the
-        // vault. The rows highlight through the same list selector
-        // as a normal press while the long press builds.
+        timelineList = listView
+        // In selection mode a tap toggles the entry; outside it a
+        // tap does nothing, as before.
+        listView.setOnItemClickListener { _, _, position, _ ->
+            if (selecting) toggleSelection(position)
+        }
+        // Long press enters selection mode with that entry chosen
+        // (the standard pattern), or toggles it like a tap when
+        // selection is already running.
         listView.setOnItemLongClickListener { _, _, position, _ ->
-            val record = records.getOrNull(position)
-            if (record != null) {
-                confirmDeleteEntry(record)
-                true
-            } else {
+            if (records.getOrNull(position) == null) {
                 false
+            } else {
+                if (selecting) toggleSelection(position) else enterSelection(position)
+                true
             }
         }
         root.addView(listView, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f))
         setContentView(root)
     }
 
-    // -------------------------------------------------------------- Delete
+    // ------------------------------------------------------------ Selection
 
-    private fun confirmDeleteEntry(record: VaultLogic.CallRecord) {
-        AlertDialog.Builder(this)
-            .setTitle("Delete this entry from the vault?")
-            .setMessage(
-                "This removes this one call from the vault. It cannot be undone. " +
-                    "Nothing is deleted from the phone's own call log."
-            )
-            .setPositiveButton("Delete") { _, _ -> deleteEntry(record) }
-            .setNegativeButton("Cancel", null)
-            .show()
-    }
-
-    private fun deleteEntry(record: VaultLogic.CallRecord) {
-        VaultExecutor.service.execute {
-            val helper = VaultDb.get(this)
-            helper.deleteRecord(helper.writableDatabase, record.vaultId)
-            val remaining = helper.forNumber(helper.readableDatabase, numberNorm)
-            runOnUiThread {
-                Toast.makeText(this, "Entry deleted from the vault", Toast.LENGTH_SHORT).show()
-                if (remaining.isEmpty()) {
-                    // That was the last entry for this number: leave
-                    // cleanly instead of showing an empty screen.
-                    finish()
-                } else {
-                    records = remaining
-                    buildUi()
-                }
+    /**
+     * The selection bar: close, the live count, Select all and
+     * Delete. Hidden unless selection mode is running; it is built
+     * with every screen build and shown by [applySelectionUi].
+     */
+    private fun buildSelectionBar(): LinearLayout {
+        val bar = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            visibility = View.GONE
+            setPadding(0, dp(2), 0, dp(8))
+        }
+        val close = TextView(this).apply {
+            text = "✕"
+            textSize = 16f
+            setTextColor(color(R.color.text))
+            gravity = Gravity.CENTER
+            setPadding(dp(10), dp(8), dp(14), dp(8))
+            isClickable = true
+            pressFeedback()
+            setOnClickListener { exitSelection() }
+        }
+        bar.addView(close)
+        val count = TextView(this).apply {
+            textSize = 15f
+            typeface = UiKit.mediumTypeface
+            setTextColor(color(R.color.text))
+            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+        }
+        selectionCount = count
+        bar.addView(count)
+        val selectAll = TextView(this).apply {
+            text = "Select all"
+            textSize = 14f
+            setTextColor(color(R.color.primary))
+            setPadding(dp(12), dp(8), dp(12), dp(8))
+            isClickable = true
+            pressFeedback()
+            setOnClickListener {
+                selectedPositions.clear()
+                for (i in records.indices) selectedPositions.add(i)
+                applySelectionUi()
             }
         }
+        bar.addView(selectAll)
+        val delete = TextView(this).apply {
+            text = "Delete"
+            textSize = 14f
+            typeface = UiKit.mediumTypeface
+            setTextColor(color(R.color.red))
+            setPadding(dp(12), dp(8), dp(4), dp(8))
+            isClickable = true
+            pressFeedback()
+            setOnClickListener { confirmDeleteSelected() }
+        }
+        bar.addView(delete)
+        selectionBar = bar
+        return bar
+    }
+
+    private fun enterSelection(position: Int) {
+        selecting = true
+        selectedPositions.add(position)
+        applySelectionUi()
+    }
+
+    private fun toggleSelection(position: Int) {
+        if (!selectedPositions.add(position)) selectedPositions.remove(position)
+        if (selectedPositions.isEmpty()) selecting = false
+        applySelectionUi()
+    }
+
+    private fun exitSelection() {
+        selecting = false
+        selectedPositions.clear()
+        applySelectionUi()
+    }
+
+    /** Push the selection state into the displays, the bar and the list. */
+    private fun applySelectionUi() {
+        for (d in timelineDisplays) d.selected = false
+        for (p in selectedPositions) timelineDisplays.getOrNull(p)?.selected = true
+        timelineAdapter?.notifyDataSetChanged()
+        selectionBar?.visibility = if (selecting) View.VISIBLE else View.GONE
+        selectionCount?.text = selectedPositions.size.toString() + " selected"
+    }
+
+    // -------------------------------------------------------------- Delete
+
+    /**
+     * The selection delete confirmation. One dialog, two flavors:
+     * vault only, or vault and phone log. Both tombstone the keys,
+     * so the confirm can honestly promise the entries never come
+     * back to this phone.
+     */
+    private fun confirmDeleteSelected() {
+        val targets = selectedPositions.sorted().mapNotNull { records.getOrNull(it) }
+        if (targets.isEmpty()) return
+        val count = targets.size
+        val title: String
+        val message: String
+        if (count == 1) {
+            title = "Delete this entry from the vault?"
+            message = "This removes this one call from the vault. " +
+                "It will not come back on this phone, even if it is still in " +
+                "your call log or an old backup."
+        } else {
+            title = "Delete " + count + " entries from the vault?"
+            message = "This removes " + count + " entries from the vault. " +
+                "They will not come back on this phone, even if they are still in " +
+                "your call log or an old backup."
+        }
+        VaultDialog.deleteConfirm(this, title, message,
+            onVaultOnly = { performDelete(targets, alsoPhone = false) },
+            onVaultAndPhone = { performDelete(targets, alsoPhone = true) }
+        )
     }
 
     private fun confirmDeleteAll() {
-        AlertDialog.Builder(this)
-            .setTitle("Delete all entries for this number?")
-            .setMessage(
-                "This removes every entry for this number from the vault, " +
-                    records.size + " in total. It cannot be undone. " +
-                    "Nothing is deleted from the phone's own call log."
-            )
-            .setPositiveButton("Delete all") { _, _ -> deleteAllEntries() }
-            .setNegativeButton("Cancel", null)
-            .show()
+        val targets = records
+        if (targets.isEmpty()) return
+        VaultDialog.deleteConfirm(
+            this,
+            "Delete all entries for this number?",
+            "This removes every entry for this number from the vault, " +
+                targets.size + " in total. They will not come back on this phone, " +
+                "even if they are still in your call log or an old backup.",
+            onVaultOnly = { performDelete(targets, alsoPhone = false) },
+            onVaultAndPhone = { performDelete(targets, alsoPhone = true) }
+        )
     }
 
-    private fun deleteAllEntries() {
+    /**
+     * Run one confirmed delete on the vault worker: tombstones and
+     * vault rows in one transaction, then (for the permanent
+     * flavor) the phone log rows. The result dialog states the
+     * plain counts, and its OK either rebuilds this screen or, when
+     * that was the person's last entry, leaves cleanly instead of
+     * showing an empty screen.
+     */
+    private fun performDelete(targets: List<VaultLogic.CallRecord>, alsoPhone: Boolean) {
         VaultExecutor.service.execute {
             val helper = VaultDb.get(this)
-            helper.deleteNumber(helper.writableDatabase, numberNorm)
+            val vaultRemoved = helper.deleteEntries(
+                helper.writableDatabase, targets, System.currentTimeMillis()
+            )
+            val phoneRemoved: Int? = if (alsoPhone) {
+                SyncEngine.deleteFromPhoneLog(this, targets)
+            } else {
+                null
+            }
+            val remaining = helper.forNumber(helper.readableDatabase, numberNorm)
             runOnUiThread {
-                Toast.makeText(this, "Entries deleted from the vault", Toast.LENGTH_SHORT).show()
-                finish()
+                VaultDialog.message(
+                    this, "Entries deleted",
+                    VaultLogic.deleteOutcomeText(vaultRemoved, phoneRemoved),
+                    onPositive = {
+                        if (remaining.isEmpty()) {
+                            finish()
+                        } else {
+                            records = remaining
+                            buildUi()
+                        }
+                    }
+                )
             }
         }
     }
@@ -363,10 +515,7 @@ class PersonActivity : Activity() {
             Toast.makeText(this, "Allow call log access in the main screen first", Toast.LENGTH_LONG).show()
             return
         }
-        val progress = ProgressDialog(this)
-        progress.setMessage("Restoring calls for this number")
-        progress.setCancelable(false)
-        progress.show()
+        val progress = VaultDialog.progress(this, "Restoring calls for this number")
         val toRestore = records.reversed() // oldest first
         VaultExecutor.service.execute {
             val result = SyncEngine.restore(this, toRestore)
@@ -375,11 +524,7 @@ class PersonActivity : Activity() {
                 val msg = if (result.error != null) result.error
                 else "Put " + result.inserted + " calls back into the phone call list, skipped " +
                     result.skipped + " that were already there."
-                AlertDialog.Builder(this)
-                    .setTitle("Restore this number")
-                    .setMessage(msg)
-                    .setPositiveButton("OK", null)
-                    .show()
+                VaultDialog.message(this, "Restore this number", msg)
             }
         }
     }

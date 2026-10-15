@@ -5,14 +5,16 @@ import android.content.res.Configuration
 import android.content.res.Resources
 
 /**
- * Pure black AMOLED palette.
+ * AMOLED palette: a true black page with lifted dark surfaces.
  *
  * Android has no resource qualifier for "amoled", so the third theme is
  * a Resources wrapper: night mode is forced on by UiKit.wrapContext
- * (so values-night applies as the base) and the dark surface colors
- * are substituted with true black at lookup time. Accents stay the
- * dark ones (primary #84A3CD, text #EDEFF3, muted #ABB0BA) and pass
- * through untouched.
+ * (so values-night applies as the base) and surface colors are
+ * substituted at lookup time. The page background stays true black,
+ * but cards, tiles and inputs sit one step above it (the v1.2.0
+ * layering), so sections read as layers on the black instead of
+ * vanishing into it. Accents stay the dark ones (primary #84A3CD,
+ * text #EDEFF3, muted #ABB0BA) and pass through untouched.
  */
 class AmoledResources(orig: Resources) :
     Resources(orig.assets, orig.displayMetrics, Configuration(orig.configuration)) {
@@ -33,14 +35,22 @@ class AmoledResources(orig: Resources) :
         private const val BLACK = 0xFF000000.toInt()
         private const val BORDER = 0xFF2A2F3A.toInt()
 
+        // Lifted surfaces over the true black page: surface is the
+        // quietest layer (segment tracks, drawer stat blocks), card
+        // and the unselected pill sit one step higher, tiles higher
+        // still so their icons keep a visible home.
+        private const val SURFACE = 0xFF101319.toInt()
+        private const val CARD = 0xFF171A21.toInt()
+        private const val TILE = 0xFF222834.toInt()
+
         private val AMOLED: Map<Int, Int> = mapOf(
-            // Every surface pure black.
+            // The page itself stays true black; surfaces lift off it.
             R.color.bg to BLACK,
-            R.color.card to BLACK,
-            R.color.surface to BLACK,
-            R.color.tile_bg to BLACK,
-            R.color.pill_unsel_bg to BLACK,
-            R.color.input_fill to BLACK,
+            R.color.card to CARD,
+            R.color.surface to SURFACE,
+            R.color.tile_bg to TILE,
+            R.color.pill_unsel_bg to CARD,
+            R.color.input_fill to SURFACE,
             // Borders are how cards and segments separate on black.
             R.color.border to BORDER,
             R.color.pill_unsel_border to BORDER,

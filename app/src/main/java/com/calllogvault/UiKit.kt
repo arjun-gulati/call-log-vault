@@ -203,6 +203,21 @@ object UiKit {
         return if (r is AmoledResources) r.getColor(id) else r.getColor(id, null)
     }
 
+    /**
+     * The shared card surface (v1.2.0): the theme's card color with
+     * a one dp border, at [radiusDp] corners. On Light the border
+     * is the subtle separation; on Dark the lifted card color does
+     * most of it; on AMOLED the card color itself is lifted off the
+     * true black background, so cards read as layers, not holes.
+     * A fresh drawable per call site, as drawables are stateful.
+     */
+    fun cardBackground(context: Context, radiusDp: Int): GradientDrawable =
+        GradientDrawable().apply {
+            cornerRadius = dp(context, radiusDp.toFloat()).toFloat()
+            setColor(c(context, R.color.card))
+            setStroke(dp(context, 1f), c(context, R.color.border))
+        }
+
     /** Blend opaque [fg] over opaque [bg] at [alpha] (0..1). */
     fun blendOver(bg: Int, fg: Int, alpha: Float): Int {
         val a = alpha.coerceIn(0f, 1f)
