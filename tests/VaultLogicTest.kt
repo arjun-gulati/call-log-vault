@@ -646,6 +646,10 @@ fun testRowDisplayStrings() {
         VaultLogic.personRightTop(t1, t1 + 10 * dayMs) == "14 Nov 2023")
     check("timeline subtitle",
         VaultLogic.timelineSubtitle(t1, t1) == "Today  ·  10:13 PM  ·  14 Nov 2023")
+    check("timeline subtitle yesterday keeps the date",
+        VaultLogic.timelineSubtitle(t1, t1 + dayMs) == "Yesterday  ·  10:13 PM  ·  14 Nov 2023")
+    check("timeline subtitle older has no repeated date",
+        VaultLogic.timelineSubtitle(t1, t1 + 10 * dayMs) == "Tue, 14 Nov 2023  ·  10:13 PM")
 }
 
 fun testEllipsize() {
