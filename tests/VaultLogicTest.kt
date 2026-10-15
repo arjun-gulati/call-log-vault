@@ -42,8 +42,8 @@ fun main() {
     testAutoBackupThrottle()
     testAutoBackupWriteDecision()
     testFolderNames()
+    testAppearanceMigration()
     testAppearanceResolution()
-    testAppearanceAuto()
     testBackupSchedules()
     testFormatterConsistency()
     testRowDisplayStrings()
@@ -258,65 +258,91 @@ fun testFolderNames() {
     check("plain name kept", VaultLogic.folderNameFromTreeId("Backups") == "Backups")
 }
 
-fun testAppearanceResolution() {
-    println("== appearance resolution ==")
-    val light = VaultLogic.APPEARANCE_LIGHT
-    val dark = VaultLogic.APPEARANCE_DARK
-    val amoled = VaultLogic.APPEARANCE_AMOLED
-    check("unset resolves to AMOLED", VaultLogic.resolveAppearance(false, 0, false, 0) == amoled)
-    check("legacy System resolves to AMOLED",
-        VaultLogic.resolveAppearance(false, 0, true, VaultLogic.LEGACY_APPEARANCE_SYSTEM) == amoled)
-    check("legacy Light carries over",
-        VaultLogic.resolveAppearance(false, 0, true, VaultLogic.LEGACY_APPEARANCE_LIGHT) == light)
-    check("legacy Dark carries over",
-        VaultLogic.resolveAppearance(false, 0, true, VaultLogic.LEGACY_APPEARANCE_DARK) == dark)
-    check("unknown legacy value resolves to AMOLED",
-        VaultLogic.resolveAppearance(false, 0, true, 99) == amoled)
-    check("v2 Light round trips", VaultLogic.resolveAppearance(true, light, false, 0) == light)
-    check("v2 Dark round trips", VaultLogic.resolveAppearance(true, dark, false, 0) == dark)
-    check("v2 AMOLED round trips", VaultLogic.resolveAppearance(true, amoled, false, 0) == amoled)
-    check("v2 wins over legacy", VaultLogic.resolveAppearance(true, dark, true, VaultLogic.LEGACY_APPEARANCE_LIGHT) == dark)
-    check("unknown v2 value falls back to AMOLED", VaultLogic.resolveAppearance(true, 42, false, 0) == amoled)
-    check("preset names", VaultLogic.appearanceName(light) == "Light" &&
-        VaultLogic.appearanceName(dark) == "Dark" &&
-        VaultLogic.appearanceName(amoled) == "AMOLED")
-}
-
-fun testAppearanceAuto() {
-    println("== appearance Auto resolution (v1.0.8) ==")
+fun testAppearanceMigration() {
+    println("== appearance migration to mode plus AMOLED switch ==")
     val light = VaultLogic.APPEARANCE_LIGHT
     val dark = VaultLogic.APPEARANCE_DARK
     val amoled = VaultLogic.APPEARANCE_AMOLED
     val auto = VaultLogic.APPEARANCE_AUTO
-    // Stored v2 value: Auto round trips like the concrete presets.
-    check("v2 Auto round trips", VaultLogic.resolveAppearance(true, auto, false, 0) == auto)
-    check("Auto has a name", VaultLogic.appearanceName(auto) == "Auto")
-    // Explicit modes resolve to themselves, day and night alike.
-    check("explicit Light in day", VaultLogic.resolveAppearance(light, amoled, false) == light)
-    check("explicit Light in night", VaultLogic.resolveAppearance(light, amoled, true) == light)
-    check("explicit Dark in day", VaultLogic.resolveAppearance(dark, amoled, false) == dark)
-    check("explicit Dark in night", VaultLogic.resolveAppearance(dark, light, true) == dark)
-    check("explicit AMOLED in day", VaultLogic.resolveAppearance(amoled, dark, false) == amoled)
-    check("explicit AMOLED in night", VaultLogic.resolveAppearance(amoled, dark, true) == amoled)
-    // Auto follows the system, with the stored flavour at night.
-    check("Auto in day is Light (AMOLED flavour)",
-        VaultLogic.resolveAppearance(auto, amoled, false) == light)
-    check("Auto in day is Light (Dark flavour)",
-        VaultLogic.resolveAppearance(auto, dark, false) == light)
-    check("Auto at night with AMOLED flavour",
-        VaultLogic.resolveAppearance(auto, amoled, true) == amoled)
-    check("Auto at night with Dark flavour",
-        VaultLogic.resolveAppearance(auto, dark, true) == dark)
-    // A flavour that is not a dark preset counts as AMOLED.
-    check("Auto at night with Light flavour falls back to AMOLED",
-        VaultLogic.resolveAppearance(auto, light, true) == amoled)
-    check("Auto at night with Auto flavour falls back to AMOLED",
-        VaultLogic.resolveAppearance(auto, auto, true) == amoled)
-    check("Auto at night with garbage flavour falls back to AMOLED",
-        VaultLogic.resolveAppearance(auto, 99, true) == amoled)
+    fun mig(hasV2: Boolean, v2: Int, hasFlavour: Boolean, flavour: Int,
+            hasLegacy: Boolean, legacy: Int) =
+        VaultLogic.migrateAppearance(hasV2, v2, hasFlavour, flavour, hasLegacy, legacy)
+    // Fresh install: nothing stored anywhere.
+    check("fresh install is Dark mode with the switch on",
+        mig(false, 0, false, 0, false, 0) == VaultLogic.AppearanceState(dark, true))
+    // Legacy v1.0.1 values, no v2 pref.
+    check("legacy System lands on Dark mode with the switch on",
+        mig(false, 0, false, 0, true, VaultLogic.LEGACY_APPEARANCE_SYSTEM) ==
+            VaultLogic.AppearanceState(dark, true))
+    check("legacy Light carries over as Light",
+        mig(false, 0, false, 0, true, VaultLogic.LEGACY_APPEARANCE_LIGHT).mode == light)
+    check("legacy Dark carries over as Dark mode with the switch off",
+        mig(false, 0, false, 0, true, VaultLogic.LEGACY_APPEARANCE_DARK) ==
+            VaultLogic.AppearanceState(dark, false))
+    check("unknown legacy value lands on Dark mode with the switch on",
+        mig(false, 0, false, 0, true, 99) == VaultLogic.AppearanceState(dark, true))
+    // Stored v2 presets from before the refinement.
+    check("stored Light stays Light",
+        mig(true, light, false, 0, false, 0).mode == light)
+    check("stored Light with a Dark flavour starts with the switch off",
+        mig(true, light, true, dark, false, 0) == VaultLogic.AppearanceState(light, false))
+    check("stored Light with an AMOLED flavour starts with the switch on",
+        mig(true, light, true, amoled, false, 0) == VaultLogic.AppearanceState(light, true))
+    check("stored Dark becomes Dark mode with the switch off",
+        mig(true, dark, false, 0, false, 0) == VaultLogic.AppearanceState(dark, false))
+    check("stored Dark stays off even with an AMOLED flavour stored",
+        mig(true, dark, true, amoled, false, 0) == VaultLogic.AppearanceState(dark, false))
+    check("stored AMOLED becomes Dark mode with the switch on",
+        mig(true, amoled, false, 0, false, 0) == VaultLogic.AppearanceState(dark, true))
+    check("stored AMOLED stays on even with a Dark flavour stored",
+        mig(true, amoled, true, dark, false, 0) == VaultLogic.AppearanceState(dark, true))
+    // Stored Auto: the switch takes the remembered flavour.
+    check("stored Auto with an AMOLED flavour starts with the switch on",
+        mig(true, auto, true, amoled, false, 0) == VaultLogic.AppearanceState(auto, true))
+    check("stored Auto with a Dark flavour starts with the switch off",
+        mig(true, auto, true, dark, false, 0) == VaultLogic.AppearanceState(auto, false))
+    check("stored Auto with no flavour starts with the switch on",
+        mig(true, auto, false, 0, false, 0) == VaultLogic.AppearanceState(auto, true))
+    check("stored Auto with a garbage flavour starts with the switch on",
+        mig(true, auto, true, 99, false, 0) == VaultLogic.AppearanceState(auto, true))
+    // Priority and fallback.
+    check("v2 wins over legacy",
+        mig(true, dark, false, 0, true, VaultLogic.LEGACY_APPEARANCE_LIGHT) ==
+            VaultLogic.AppearanceState(dark, false))
+    check("unknown v2 value keeps the AMOLED look",
+        mig(true, 42, false, 0, false, 0) == VaultLogic.AppearanceState(dark, true))
+    check("preset and mode names", VaultLogic.appearanceName(light) == "Light" &&
+        VaultLogic.appearanceName(dark) == "Dark" &&
+        VaultLogic.appearanceName(amoled) == "AMOLED" &&
+        VaultLogic.appearanceName(auto) == "Auto")
+}
+
+fun testAppearanceResolution() {
+    println("== appearance resolution: mode plus AMOLED switch ==")
+    val light = VaultLogic.APPEARANCE_LIGHT
+    val dark = VaultLogic.APPEARANCE_DARK
+    val amoled = VaultLogic.APPEARANCE_AMOLED
+    val auto = VaultLogic.APPEARANCE_AUTO
+    // Light is always Light, switch and system alike.
+    check("Light in day, switch off", VaultLogic.resolveAppearance(light, false, false) == light)
+    check("Light in day, switch on", VaultLogic.resolveAppearance(light, true, false) == light)
+    check("Light at night, switch off", VaultLogic.resolveAppearance(light, false, true) == light)
+    check("Light at night, switch on", VaultLogic.resolveAppearance(light, true, true) == light)
+    // Dark renders plain Dark or AMOLED purely by the switch.
+    check("Dark with the switch off in day", VaultLogic.resolveAppearance(dark, false, false) == dark)
+    check("Dark with the switch off at night", VaultLogic.resolveAppearance(dark, false, true) == dark)
+    check("Dark with the switch on in day", VaultLogic.resolveAppearance(dark, true, false) == amoled)
+    check("Dark with the switch on at night", VaultLogic.resolveAppearance(dark, true, true) == amoled)
+    // Auto follows the system; only its night side reads the switch.
+    check("Auto in day, switch off", VaultLogic.resolveAppearance(auto, false, false) == light)
+    check("Auto in day, switch on", VaultLogic.resolveAppearance(auto, true, false) == light)
+    check("Auto at night, switch off", VaultLogic.resolveAppearance(auto, false, true) == dark)
+    check("Auto at night, switch on", VaultLogic.resolveAppearance(auto, true, true) == amoled)
     // Unknown modes keep the standing AMOLED fallback.
     check("unknown mode falls back to AMOLED",
-        VaultLogic.resolveAppearance(42, dark, false) == amoled)
+        VaultLogic.resolveAppearance(42, false, false) == amoled)
+    check("unknown mode falls back to AMOLED at night too",
+        VaultLogic.resolveAppearance(42, true, true) == amoled)
 }
 
 fun testBackupSchedules() {
