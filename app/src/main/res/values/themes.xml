@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <style name="Theme.CallVault" parent="android:Theme.Material.Light.NoActionBar">
+        <item name="android:windowBackground">@color/bg</item>
+        <item name="android:colorBackground">@color/bg</item>
+        <item name="android:textColorPrimary">@color/text</item>
+        <item name="android:textColor">@color/text</item>
+        <item name="android:textColorHint">@color/muted</item>
+        <item name="android:editTextColor">@color/text</item>
+        <item name="android:colorAccent">@color/primary</item>
+        <item name="android:dialogTheme">@style/Theme.CallVault.Dialog</item>
+        <item name="android:alertDialogTheme">@style/Theme.CallVault.AlertDialog</item>
+    </style>
+
+    <style name="Theme.CallVault.Dialog" parent="android:Theme.Material.Light.Dialog.NoActionBar">
+        <item name="android:windowBackground">@color/card</item>
+        <item name="android:textColorPrimary">@color/text</item>
+        <item name="android:textColor">@color/text</item>
+        <item name="android:editTextColor">@color/text</item>
+        <item name="android:colorAccent">@color/primary</item>
+    </style>
+
+    <style name="Theme.CallVault.AlertDialog" parent="android:Theme.Material.Light.Dialog.Alert">
+        <item name="android:windowBackground">@color/card</item>
+        <item name="android:textColorPrimary">@color/text</item>
+        <item name="android:textColor">@color/text</item>
+        <item name="android:editTextColor">@color/text</item>
+        <item name="android:colorAccent">@color/primary</item>
+    </style>
+</resources>

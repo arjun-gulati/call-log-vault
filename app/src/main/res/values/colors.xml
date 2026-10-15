@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Light theme palette. -->
+    <color name="bg">#F7F9FB</color>
+    <color name="card">#FFFFFF</color>
+    <color name="surface">#EFF2F6</color>
+    <color name="text">#2B303B</color>
+    <color name="muted">#5C6370</color>
+    <color name="eyebrow">#5C6370</color>
+    <color name="accent">#5583BE</color>
+    <color name="primary">#5583BE</color>
+    <color name="primary_dark">#3E6BA0</color>
+    <color name="on_primary">#FFFFFF</color>
+    <color name="green">#2FA36B</color>
+    <color name="red">#D64545</color>
+    <color name="amber">#C77B1F</color>
+    <color name="border">#E2E6EB</color>
+    <color name="pill_sel_bg">#1F5583BE</color>
+    <color name="pill_sel_border">#5583BE</color>
+    <color name="pill_sel_text">#2B303B</color>
+    <color name="pill_unsel_bg">#FFFFFF</color>
+    <color name="pill_unsel_border">#E2E6EB</color>
+    <color name="pill_unsel_text">#5C6370</color>
+    <color name="input_fill">#F1F4F9</color>
+    <color name="tile_bg">#E9EFF6</color>
+    <color name="tile_icon">#5583BE</color>
+</resources>
