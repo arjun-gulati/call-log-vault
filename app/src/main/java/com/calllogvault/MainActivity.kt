@@ -58,7 +58,7 @@ class MainActivity : Activity() {
 
     override fun getResources(): Resources {
         val base = super.getResources()
-        if (!UiKit.isAmoled(this)) return base
+        if (!UiKit.isAmoled(this, base)) return base
         if (wrappedRes == null) wrappedRes = UiKit.wrapResources(this, base, null)
         return wrappedRes!!
     }
@@ -87,6 +87,7 @@ class MainActivity : Activity() {
     private lateinit var statSync: TextView
     private lateinit var statAuto: TextView
     private var autoSubtitle: TextView? = null
+    private var scheduleSubtitle: TextView? = null
 
     private var allRecords: List<VaultLogic.CallRecord> = emptyList()
     private var people: List<VaultLogic.PersonSummary> = emptyList()
@@ -560,6 +561,12 @@ class MainActivity : Activity() {
         }
         autoSubtitle = autoRow.second
         body.addView(autoRow.first)
+        val scheduleRow = drawerRow(R.drawable.ic_nav_backup, "Backup schedule", "") {
+            closeDrawer()
+            showBackupScheduleDialog()
+        }
+        scheduleSubtitle = scheduleRow.second
+        body.addView(scheduleRow.first)
 
         body.addView(eyebrow("APP"))
         body.addView(drawerRow(R.drawable.ic_nav_sync, "Sync now", null) {
@@ -583,10 +590,11 @@ class MainActivity : Activity() {
         frame.addView(scrim)
         frame.addView(panel)
         updateAutoRow()
+        updateScheduleRow()
     }
 
     /**
-     * Theme presets as drawer segments: three equal
+     * Theme presets as drawer segments: four equal
      * buttons in one rounded container. Tapping one saves the preset
      * and recreates the activity. The Appearance popup dialog is gone.
      */
@@ -607,7 +615,8 @@ class MainActivity : Activity() {
         val presets = listOf(
             UiKit.APPEARANCE_LIGHT to "Light",
             UiKit.APPEARANCE_DARK to "Dark",
-            UiKit.APPEARANCE_AMOLED to "AMOLED"
+            UiKit.APPEARANCE_AMOLED to "AMOLED",
+            UiKit.APPEARANCE_AUTO to "Auto"
         )
         val current = UiKit.appearance(this)
         for ((value, label) in presets) {
@@ -865,6 +874,7 @@ class MainActivity : Activity() {
         if (drawerOpen) return
         drawerOpen = true
         updateAutoRow()
+        updateScheduleRow()
         scrim.visibility = View.VISIBLE
         scrim.alpha = 0f
         try {
@@ -914,6 +924,43 @@ class MainActivity : Activity() {
         if (::statAuto.isInitialized) {
             statAuto.text = autoBackupStatText()
         }
+    }
+
+    private fun updateScheduleRow() {
+        val sub = scheduleSubtitle ?: return
+        sub.text = VaultLogic.backupScheduleName(AutoBackup.schedule(this))
+        sub.visibility = View.VISIBLE
+    }
+
+    /**
+     * Single choice dialog for the backup schedule (v1.0.8). Smart
+     * is the original throttle and stays the default; the others are
+     * plainer promises about how often the rolling file is rewritten.
+     * The choice takes effect on the next scheduled auto backup run.
+     */
+    private fun showBackupScheduleDialog() {
+        val schedules = listOf(
+            VaultLogic.BACKUP_SCHEDULE_SMART,
+            VaultLogic.BACKUP_SCHEDULE_EVERY_CALL,
+            VaultLogic.BACKUP_SCHEDULE_EVERY_6H,
+            VaultLogic.BACKUP_SCHEDULE_DAILY
+        )
+        val labels = arrayOf(
+            "Smart (recommended)",
+            VaultLogic.backupScheduleName(VaultLogic.BACKUP_SCHEDULE_EVERY_CALL),
+            VaultLogic.backupScheduleName(VaultLogic.BACKUP_SCHEDULE_EVERY_6H),
+            VaultLogic.backupScheduleName(VaultLogic.BACKUP_SCHEDULE_DAILY)
+        )
+        val current = schedules.indexOf(AutoBackup.schedule(this)).coerceAtLeast(0)
+        AlertDialog.Builder(this)
+            .setTitle("Backup schedule")
+            .setSingleChoiceItems(labels, current) { dialog, which ->
+                AutoBackup.setSchedule(this, schedules[which])
+                updateScheduleRow()
+                dialog.dismiss()
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
     }
 
     private fun autoBackupStatText(): String {
@@ -1590,7 +1637,16 @@ class MainActivity : Activity() {
                 .append('\n')
             if (AutoBackup.hasError(this)) sb.append("Auto backup status: needs attention\n")
         }
-        sb.append("Appearance: ").append(UiKit.appearanceName(UiKit.appearance(this))).append('\n')
+        val appearanceMode = UiKit.appearance(this)
+        val appearanceText = if (appearanceMode == UiKit.APPEARANCE_AUTO) {
+            // Never leave Auto ambiguous in Status: name the concrete
+            // preset it currently resolves to as well.
+            UiKit.appearanceName(appearanceMode) + " (" +
+                UiKit.appearanceName(UiKit.concreteAppearance(this)) + ")"
+        } else {
+            UiKit.appearanceName(appearanceMode)
+        }
+        sb.append("Appearance: ").append(appearanceText).append('\n')
         sb.append("\nDiagnostics\n")
         sb.append("Vault entries in database: ").append(count).append('\n')
         sb.append("Last sync time: ")

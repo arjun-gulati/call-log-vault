@@ -151,10 +151,15 @@ object Backup {
  * skips the listing entirely. The listing fallback runs at most once
  * per write, only when the remembered file cannot be opened.
  *
- * Throttle (pure rule in VaultLogic.shouldWriteAutoBackup): write on
- * the first capture, right away at 20 or more new calls, otherwise at
- * most once every 15 minutes. Failures are recorded silently in prefs
- * and surfaced only as a drawer subtitle, never as a nag.
+ * Throttle (pure rule in VaultLogic.shouldWriteBackup, under the
+ * schedule the user picked in the drawer): the default Smart schedule
+ * is the original rule, write on the first capture, right away at 20
+ * or more new calls, otherwise at most once every 15 minutes. The
+ * other schedules write after every call, at most once every 6
+ * hours, or at most once a day. A forced write (the folder was just
+ * picked) bypasses the schedule entirely. Failures are recorded
+ * silently in prefs and surfaced only as a drawer subtitle, never
+ * as a nag.
  */
 object AutoBackup {
 
@@ -165,6 +170,7 @@ object AutoBackup {
     private const val KEY_SINCE = "auto_since"
     private const val KEY_ERROR = "auto_error"
     private const val KEY_FORCE = "auto_force_next"
+    private const val KEY_SCHEDULE = "auto_schedule"
 
     /** At most one write runs at a time, across every caller. */
     private val writeInProgress = java.util.concurrent.atomic.AtomicBoolean(false)
@@ -185,6 +191,27 @@ object AutoBackup {
             .remove(KEY_FILE_URI)
             .putBoolean(KEY_ERROR, false)
             .apply()
+    }
+
+    /**
+     * The chosen backup schedule (VaultLogic.BACKUP_SCHEDULE_*).
+     * Defaults to Smart; an unknown stored value also reads as
+     * Smart, and VaultLogic.shouldWriteBackup treats unknown
+     * values as Smart too, so the two can never disagree.
+     */
+    fun schedule(context: Context): Int {
+        val stored = prefs(context).getInt(KEY_SCHEDULE, VaultLogic.BACKUP_SCHEDULE_SMART)
+        return when (stored) {
+            VaultLogic.BACKUP_SCHEDULE_SMART,
+            VaultLogic.BACKUP_SCHEDULE_EVERY_CALL,
+            VaultLogic.BACKUP_SCHEDULE_EVERY_6H,
+            VaultLogic.BACKUP_SCHEDULE_DAILY -> stored
+            else -> VaultLogic.BACKUP_SCHEDULE_SMART
+        }
+    }
+
+    fun setSchedule(context: Context, schedule: Int) {
+        prefs(context).edit().putInt(KEY_SCHEDULE, schedule).apply()
     }
 
     fun lastWriteMs(context: Context): Long = prefs(context).getLong(KEY_LAST_MS, 0L)
@@ -246,15 +273,19 @@ object AutoBackup {
         prefs(context).getString(KEY_FILE_URI, "") ?: ""
 
     /**
-     * Entry point for AutoBackupJobService. Decides from the throttle
-     * (or a pending immediate request from the folder pick) whether to
-     * write, then writes through the guarded path. Never throws.
+     * Entry point for AutoBackupJobService. Decides from the chosen
+     * schedule (or a pending immediate request from the folder pick,
+     * which bypasses the schedule) whether to write, then writes
+     * through the guarded path. Never throws.
      */
     fun runScheduledWrite(context: Context): Boolean {
         if (!hasFolder(context)) return false
         val force = consumeForceRequest(context)
         val now = System.currentTimeMillis()
-        if (!VaultLogic.shouldAttemptAutoWrite(force, lastWriteMs(context), newSince(context), now)) {
+        if (!force && !VaultLogic.shouldWriteBackup(
+                schedule(context), lastWriteMs(context), newSince(context), now
+            )
+        ) {
             return false
         }
         return writeNow(context)

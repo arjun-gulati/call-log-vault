@@ -28,7 +28,11 @@ object VaultLogic {
         val type: Int,
         val durationSec: Long,
         val subscriptionId: String = "",
-        val systemId: Long = -1L
+        val systemId: Long = -1L,
+        // Row id inside the vault database itself, filled when a
+        // record is read back from VaultDb. Records built from the
+        // phone call log or a backup file carry -1 here.
+        val vaultId: Long = -1L
     )
 
     data class PersonSummary(
@@ -233,24 +237,66 @@ object VaultLogic {
         return nowMs - lastWriteMs >= AUTO_BACKUP_MIN_INTERVAL_MS
     }
 
-    /**
-     * Whether a scheduled auto backup run should attempt a write. A
-     * forced run (the folder was just picked, so the first file should
-     * appear right away) always writes; any other run defers to the
-     * throttle in [shouldWriteAutoBackup].
-     */
-    fun shouldAttemptAutoWrite(
-        force: Boolean,
-        lastWriteMs: Long,
-        newCallsSince: Int,
-        nowMs: Long
-    ): Boolean {
-        if (force) return true
-        return shouldWriteAutoBackup(lastWriteMs, newCallsSince, nowMs)
-    }
-
     /** Auto backup is scheduled only when a sync actually added calls. */
     fun shouldScheduleAutoBackup(added: Int): Boolean = added > 0
+
+    // --------------------------------------- Backup schedules (v1.0.8)
+
+    /** Smart: the original throttle, unchanged. The default. */
+    const val BACKUP_SCHEDULE_SMART = 0
+
+    /** Write whenever a sync added at least one new call. */
+    const val BACKUP_SCHEDULE_EVERY_CALL = 1
+
+    /** Write at most once every 6 hours. */
+    const val BACKUP_SCHEDULE_EVERY_6H = 2
+
+    /** Write at most once every 24 hours. */
+    const val BACKUP_SCHEDULE_DAILY = 3
+
+    const val BACKUP_6H_INTERVAL_MS = 6L * 60 * 60 * 1000
+    const val BACKUP_DAY_INTERVAL_MS = 24L * 60 * 60 * 1000
+
+    /** Short display name of a schedule, for the drawer row subtitle. */
+    fun backupScheduleName(schedule: Int): String = when (schedule) {
+        BACKUP_SCHEDULE_EVERY_CALL -> "After every call"
+        BACKUP_SCHEDULE_EVERY_6H -> "Every 6 hours"
+        BACKUP_SCHEDULE_DAILY -> "Daily"
+        else -> "Smart"
+    }
+
+    /**
+     * The write decision for one scheduled auto backup run, under the
+     * user's chosen [schedule]. A run happens when a sync added calls
+     * (or a write was forced, which bypasses this function entirely).
+     *
+     * - SMART defers to the original throttle, exactly as before.
+     * - EVERY_CALL writes whenever at least one new call arrived
+     *   since the last write.
+     * - EVERY_6H and DAILY write when at least one new call arrived
+     *   and the interval has passed since the last write. A backup
+     *   that was never written counts as due, so the first file
+     *   appears as soon as there is anything to put in it.
+     *
+     * Nothing new since the last write never writes, in every mode.
+     * An unknown schedule value behaves as SMART.
+     */
+    fun shouldWriteBackup(
+        schedule: Int,
+        lastWriteMs: Long,
+        newCallsSinceWrite: Int,
+        nowMs: Long
+    ): Boolean {
+        if (newCallsSinceWrite <= 0) return false
+        return when (schedule) {
+            BACKUP_SCHEDULE_EVERY_CALL -> true
+            BACKUP_SCHEDULE_EVERY_6H ->
+                lastWriteMs <= 0L || nowMs - lastWriteMs >= BACKUP_6H_INTERVAL_MS
+            BACKUP_SCHEDULE_DAILY ->
+                lastWriteMs <= 0L || nowMs - lastWriteMs >= BACKUP_DAY_INTERVAL_MS
+            else -> shouldWriteAutoBackup(lastWriteMs, newCallsSinceWrite, nowMs)
+        }
+    }
 
     /**
      * Whether a finished sync needs the full on screen rebuild
@@ -362,6 +408,13 @@ object VaultLogic {
     const val APPEARANCE_DARK = 1
     const val APPEARANCE_AMOLED = 2
 
+    /**
+     * Follow the device (v1.0.8): not a concrete preset of its own,
+     * it resolves through [resolveAppearance] mode overload below
+     * using the system night flag and the stored dark flavour.
+     */
+    const val APPEARANCE_AUTO = 3
+
     // v1.0.1 legacy values, stored under the old "appearance" key.
     const val LEGACY_APPEARANCE_SYSTEM = 0
     const val LEGACY_APPEARANCE_LIGHT = 1
@@ -377,7 +430,7 @@ object VaultLogic {
     fun resolveAppearance(hasV2: Boolean, v2: Int, hasLegacy: Boolean, legacy: Int): Int {
         if (hasV2) {
             return if (v2 == APPEARANCE_LIGHT || v2 == APPEARANCE_DARK ||
-                v2 == APPEARANCE_AMOLED
+                v2 == APPEARANCE_AMOLED || v2 == APPEARANCE_AUTO
             ) v2 else APPEARANCE_AMOLED
         }
         if (hasLegacy && legacy == LEGACY_APPEARANCE_LIGHT) return APPEARANCE_LIGHT
@@ -385,9 +438,36 @@ object VaultLogic {
         return APPEARANCE_AMOLED
     }
 
+    /**
+     * Resolve a stored appearance [mode] to the concrete preset to
+     * render with. Explicit presets resolve to themselves whatever
+     * the system says. AUTO resolves to Light in light mode and to
+     * [darkFlavour] in night mode; the flavour is whichever of Dark
+     * or AMOLED the user last picked on purpose, and any other
+     * stored flavour value (Light, Auto, garbage) counts as AMOLED.
+     * An unknown mode counts as AMOLED, the standing fallback.
+     */
+    fun resolveAppearance(mode: Int, darkFlavour: Int, systemNight: Boolean): Int {
+        return when (mode) {
+            APPEARANCE_LIGHT -> APPEARANCE_LIGHT
+            APPEARANCE_DARK -> APPEARANCE_DARK
+            APPEARANCE_AMOLED -> APPEARANCE_AMOLED
+            APPEARANCE_AUTO -> if (!systemNight) {
+                APPEARANCE_LIGHT
+            } else if (darkFlavour == APPEARANCE_DARK || darkFlavour == APPEARANCE_AMOLED) {
+                darkFlavour
+            } else {
+                APPEARANCE_AMOLED
+            }
+            else -> APPEARANCE_AMOLED
+        }
+    }
+
     fun appearanceName(value: Int): String = when (value) {
         APPEARANCE_LIGHT -> "Light"
         APPEARANCE_DARK -> "Dark"
+        APPEARANCE_AMOLED -> "AMOLED"
+        APPEARANCE_AUTO -> "Auto"
         else -> "AMOLED"
     }
 

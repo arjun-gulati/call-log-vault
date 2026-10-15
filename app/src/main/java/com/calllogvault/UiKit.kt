@@ -50,10 +50,12 @@ object UiKit {
     const val PREFS = "vault_prefs"
     private const val KEY_APPEARANCE_V2 = "appearance_v2"
     private const val KEY_APPEARANCE_LEGACY = "appearance"
+    private const val KEY_DARK_FLAVOUR = "appearance_dark_flavour"
 
     const val APPEARANCE_LIGHT = VaultLogic.APPEARANCE_LIGHT
     const val APPEARANCE_DARK = VaultLogic.APPEARANCE_DARK
     const val APPEARANCE_AMOLED = VaultLogic.APPEARANCE_AMOLED
+    const val APPEARANCE_AUTO = VaultLogic.APPEARANCE_AUTO
 
     /** The one medium typeface for the whole app, created exactly once. */
     val mediumTypeface: Typeface by lazy {
@@ -92,22 +94,75 @@ object UiKit {
     }
 
     fun setAppearance(context: Context, value: Int) {
-        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
-            .putInt(KEY_APPEARANCE_V2, value).apply()
+        val edit = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
+            .putInt(KEY_APPEARANCE_V2, value)
+        // An explicit Dark or AMOLED pick is also the flavour the
+        // Auto mode falls back to at night, so it is remembered.
+        if (value == APPEARANCE_DARK || value == APPEARANCE_AMOLED) {
+            edit.putInt(KEY_DARK_FLAVOUR, value)
+            cachedDarkFlavour = value
+        }
+        edit.apply()
         cachedAppearance = value
     }
 
-    fun isAmoled(context: Context): Boolean = appearance(context) == APPEARANCE_AMOLED
+    /** In memory copy of the dark flavour, same reasoning as above. */
+    @Volatile
+    private var cachedDarkFlavour: Int? = null
+
+    /**
+     * The dark flavour for Auto mode: whichever of Dark or AMOLED
+     * the user last chose explicitly. Defaults to AMOLED when
+     * neither was ever picked (AMOLED is also the fresh install
+     * appearance, so an untouched install behaves exactly as
+     * before when the user switches to Auto).
+     */
+    fun darkFlavour(context: Context): Int {
+        cachedDarkFlavour?.let { return it }
+        val stored = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            .getInt(KEY_DARK_FLAVOUR, APPEARANCE_AMOLED)
+        val resolved =
+            if (stored == APPEARANCE_DARK || stored == APPEARANCE_AMOLED) stored
+            else APPEARANCE_AMOLED
+        cachedDarkFlavour = resolved
+        return resolved
+    }
+
+    /** True when [res] carries the night uiMode flag. */
+    fun systemNight(res: Resources): Boolean =
+        (res.configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK) ==
+            Configuration.UI_MODE_NIGHT_YES
+
+    /**
+     * The concrete preset to render with: the stored mode resolved
+     * through VaultLogic against the dark flavour and the night
+     * flag of [res]. Callers inside a getResources() override pass
+     * the base resources they already hold; nothing here reads
+     * context.resources, so that call path can never loop.
+     */
+    fun concreteAppearance(context: Context, res: Resources): Int =
+        VaultLogic.resolveAppearance(appearance(context), darkFlavour(context), systemNight(res))
+
+    /** Concrete preset for ordinary UI thread call sites. */
+    fun concreteAppearance(context: Context): Int =
+        concreteAppearance(context, context.resources)
+
+    fun isAmoled(context: Context, res: Resources): Boolean =
+        concreteAppearance(context, res) == APPEARANCE_AMOLED
 
     fun appearanceName(value: Int): String = VaultLogic.appearanceName(value)
 
     /**
      * Force the night flag to match the chosen preset (AMOLED is night
-     * plus the black resource substitution below). Lite version of File
-     * Master's Theme.wrapContext.
+     * plus the black resource substitution below). The Auto mode is
+     * the one exception: the system night flag passes through
+     * untouched, so the concrete preset can follow the device (and
+     * the manifest leaves uiMode recreation to the system, so a
+     * flip while the app runs rethemes through a fresh activity).
      */
     fun wrapContext(newBase: Context): Context {
         val mode = try { appearance(newBase) } catch (e: Exception) { APPEARANCE_AMOLED }
+        if (mode == APPEARANCE_AUTO) return newBase
         val night = if (mode == APPEARANCE_LIGHT)
             Configuration.UI_MODE_NIGHT_NO else Configuration.UI_MODE_NIGHT_YES
         val cfg = Configuration(newBase.resources.configuration)
@@ -117,7 +172,7 @@ object UiKit {
 
     /** Resource wrapping for the AMOLED preset: only AMOLED wraps. */
     fun wrapResources(context: Context, base: Resources, cache: Resources?): Resources {
-        if (!isAmoled(context)) return base
+        if (!isAmoled(context, base)) return base
         return cache ?: AmoledResources(base)
     }
 

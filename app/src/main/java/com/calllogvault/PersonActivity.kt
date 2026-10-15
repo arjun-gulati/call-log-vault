@@ -20,7 +20,13 @@ import android.widget.ListView
 import android.widget.TextView
 import android.widget.Toast
 
-/** Full vault timeline for one number, with call and restore actions. */
+/**
+ * Full vault timeline for one number, with call and restore actions.
+ * Also the only place anything can be deleted: a long press on one
+ * timeline entry, or the delete all action, each behind a
+ * confirmation dialog, each removing vault records only. The
+ * phone's own call log is never touched by a delete.
+ */
 class PersonActivity : Activity() {
 
     private var dpF = 1f
@@ -36,7 +42,7 @@ class PersonActivity : Activity() {
 
     override fun getResources(): Resources {
         val base = super.getResources()
-        if (!UiKit.isAmoled(this)) return base
+        if (!UiKit.isAmoled(this, base)) return base
         if (wrappedRes == null) wrappedRes = UiKit.wrapResources(this, base, null)
         return wrappedRes!!
     }
@@ -210,6 +216,22 @@ class PersonActivity : Activity() {
         row.addView(restoreBtn, LinearLayout.LayoutParams(0, dp(48), 1f).apply { marginStart = dp(6) })
         root.addView(row)
 
+        // Quiet text action under the pills: delete every vault entry
+        // for this number. Deliberately not a third pill, the pill row
+        // stays about calling and restoring.
+        val deleteAll = TextView(this).apply {
+            text = "Delete all entries for this number"
+            textSize = 14f
+            setTextColor(color(R.color.red))
+            gravity = Gravity.CENTER
+            setPadding(0, dp(16), 0, dp(2))
+            isClickable = true
+            isFocusable = true
+            pressFeedback()
+            setOnClickListener { confirmDeleteAll() }
+        }
+        root.addView(deleteAll)
+
         val header = TextView(this).apply {
             text = "TIMELINE"
             textSize = 11f
@@ -263,8 +285,77 @@ class PersonActivity : Activity() {
                 }
             }
         }
+        // Long press one entry to delete just that entry from the
+        // vault. The rows highlight through the same list selector
+        // as a normal press while the long press builds.
+        listView.setOnItemLongClickListener { _, _, position, _ ->
+            val record = records.getOrNull(position)
+            if (record != null) {
+                confirmDeleteEntry(record)
+                true
+            } else {
+                false
+            }
+        }
         root.addView(listView, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f))
         setContentView(root)
+    }
+
+    // -------------------------------------------------------------- Delete
+
+    private fun confirmDeleteEntry(record: VaultLogic.CallRecord) {
+        AlertDialog.Builder(this)
+            .setTitle("Delete this entry from the vault?")
+            .setMessage(
+                "This removes this one call from the vault. It cannot be undone. " +
+                    "Nothing is deleted from the phone's own call log."
+            )
+            .setPositiveButton("Delete") { _, _ -> deleteEntry(record) }
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
+
+    private fun deleteEntry(record: VaultLogic.CallRecord) {
+        VaultExecutor.service.execute {
+            val helper = VaultDb.get(this)
+            helper.deleteRecord(helper.writableDatabase, record.vaultId)
+            val remaining = helper.forNumber(helper.readableDatabase, numberNorm)
+            runOnUiThread {
+                Toast.makeText(this, "Entry deleted from the vault", Toast.LENGTH_SHORT).show()
+                if (remaining.isEmpty()) {
+                    // That was the last entry for this number: leave
+                    // cleanly instead of showing an empty screen.
+                    finish()
+                } else {
+                    records = remaining
+                    buildUi()
+                }
+            }
+        }
+    }
+
+    private fun confirmDeleteAll() {
+        AlertDialog.Builder(this)
+            .setTitle("Delete all entries for this number?")
+            .setMessage(
+                "This removes every entry for this number from the vault, " +
+                    records.size + " in total. It cannot be undone. " +
+                    "Nothing is deleted from the phone's own call log."
+            )
+            .setPositiveButton("Delete all") { _, _ -> deleteAllEntries() }
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
+
+    private fun deleteAllEntries() {
+        VaultExecutor.service.execute {
+            val helper = VaultDb.get(this)
+            helper.deleteNumber(helper.writableDatabase, numberNorm)
+            runOnUiThread {
+                Toast.makeText(this, "Entries deleted from the vault", Toast.LENGTH_SHORT).show()
+                finish()
+            }
+        }
     }
 
     private fun restoreThisNumber() {

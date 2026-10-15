@@ -90,6 +90,7 @@ class VaultDb(context: Context) : SQLiteOpenHelper(context, "vault.db", null, 1)
      * positions that cannot change inside one cursor.
      */
     private class RowColumns(c: android.database.Cursor) {
+        val id = c.getColumnIndexOrThrow("_id")
         val numberRaw = c.getColumnIndexOrThrow("number_raw")
         val numberNorm = c.getColumnIndexOrThrow("number_norm")
         val name = c.getColumnIndexOrThrow("name_cached")
@@ -109,8 +110,25 @@ class VaultDb(context: Context) : SQLiteOpenHelper(context, "vault.db", null, 1)
             type = c.getInt(cols.type),
             durationSec = c.getLong(cols.durationSec),
             subscriptionId = c.getString(cols.subscriptionId),
-            systemId = c.getLong(cols.systemId)
+            systemId = c.getLong(cols.systemId),
+            vaultId = c.getLong(cols.id)
         )
+    }
+
+    /**
+     * Delete one record by its vault row id. Manual deletes from the
+     * person screen are the only deletes that exist anywhere in the
+     * app, and both are behind a confirmation dialog. Returns the
+     * number of rows removed (0 or 1).
+     */
+    fun deleteRecord(db: SQLiteDatabase, vaultId: Long): Int {
+        if (vaultId < 0) return 0
+        return db.delete("calls", "_id = ?", arrayOf(vaultId.toString()))
+    }
+
+    /** Delete every record for one normalized number. Returns rows removed. */
+    fun deleteNumber(db: SQLiteDatabase, numberNorm: String): Int {
+        return db.delete("calls", "number_norm = ?", arrayOf(numberNorm))
     }
 
     /** All records, newest first. */
