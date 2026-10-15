@@ -47,6 +47,9 @@ fun main() {
     testAppearanceResolution()
     testBackupSchedules()
     testWatchFolder()
+    testTombstones()
+    testProviderDeleteSpec()
+    testDeleteOutcomeText()
     testFormatterConsistency()
     testRowDisplayStrings()
     testEllipsize()
@@ -506,6 +509,102 @@ fun testWatchFolder() {
     check("status unreadable",
         VaultLogic.watchStatusText(VaultLogic.WATCH_RESULT_UNREADABLE, 0) ==
             "Watch folder: a changed backup could not be read")
+}
+
+fun testTombstones() {
+    println("== tombstones (v1.2.0 hashed manual delete markers) ==")
+    // The hash itself: a known SHA-256 test vector.
+    val abcHash = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+    check("sha256 of abc matches the known vector", VaultLogic.sha256Hex("abc") == abcHash)
+    check("tombstone hash is the key's sha256", VaultLogic.tombstoneHash("abc") == abcHash)
+    val call = rec()
+    val callKey = VaultLogic.dedupeKey(call)
+    check("tombstone hash is 64 lowercase hex chars",
+        VaultLogic.tombstoneHash(callKey).length == 64 &&
+            VaultLogic.tombstoneHash(callKey).all { it in '0'..'9' || it in 'a'..'f' })
+    check("tombstone hash is deterministic",
+        VaultLogic.tombstoneHash(callKey) == VaultLogic.tombstoneHash(VaultLogic.dedupeKey(rec())))
+    // The stored hash reveals nothing readable about the call.
+    check("the hash does not contain the number",
+        !VaultLogic.tombstoneHash(callKey).contains("919000000010"))
+    // Same number, a genuinely new call: a different date, a different key.
+    val laterCall = rec(date = call.dateMs + 86_400_000L)
+    check("same number different date makes a different key",
+        VaultLogic.dedupeKey(laterCall) != callKey)
+    check("same number different date makes a different hash",
+        VaultLogic.tombstoneHash(VaultLogic.dedupeKey(laterCall)) != VaultLogic.tombstoneHash(callKey))
+    // Acceptance: the tombstone wins over every arrival path.
+    val tombs = setOf(VaultLogic.tombstoneHash(callKey))
+    check("a tombstoned key is tombstoned", VaultLogic.isTombstoned(callKey, tombs))
+    check("another key is not tombstoned",
+        !VaultLogic.isTombstoned(VaultLogic.dedupeKey(laterCall), tombs))
+    check("no tombstones means nothing is tombstoned", !VaultLogic.isTombstoned(callKey, emptySet()))
+    check("a brand new record is accepted",
+        VaultLogic.shouldAcceptRecord(VaultLogic.dedupeKey(laterCall), emptySet(), tombs))
+    check("a record already in the vault is refused",
+        !VaultLogic.shouldAcceptRecord(callKey, setOf(callKey), emptySet()))
+    check("a tombstoned record is refused though the vault no longer holds it",
+        !VaultLogic.shouldAcceptRecord(callKey, emptySet(), tombs))
+    check("a tombstone wins over an import carrying the same key",
+        !VaultLogic.shouldAcceptRecord(callKey, setOf(VaultLogic.dedupeKey(laterCall)), tombs))
+    check("the later call from the same number is still accepted",
+        VaultLogic.shouldAcceptRecord(VaultLogic.dedupeKey(laterCall), setOf(callKey), tombs))
+    // The bulk filter keeps order and drops both kinds of refusals.
+    val other = rec(number = "5550001111", name = "Bala", date = 2000, type = VaultLogic.TYPE_OUTGOING)
+    val accepted = VaultLogic.filterAccepted(
+        listOf(other, call, laterCall), setOf(VaultLogic.dedupeKey(other)), tombs
+    )
+    check("filterAccepted drops the saved and the tombstoned, keeps the new",
+        accepted == listOf(laterCall))
+    check("filterAccepted with no tombstones keeps everything new",
+        VaultLogic.filterAccepted(listOf(call, laterCall), emptySet(), emptySet()) ==
+            listOf(call, laterCall))
+    // The watch merge plans around tombstones too.
+    val tombPlan = VaultLogic.planWatchMerge(emptyMap(), listOf(call, laterCall), tombs)
+    check("watch merge: a tombstoned arrival is not inserted",
+        tombPlan.inserts == listOf(laterCall) && tombPlan.nameUpdates.isEmpty())
+    val renamedCall = rec(name = "Asha Rani")
+    val tombRenamePlan = VaultLogic.planWatchMerge(
+        mapOf(callKey to "Asha"), listOf(renamedCall), tombs
+    )
+    check("watch merge: a tombstoned arrival is not renamed in either",
+        tombRenamePlan.inserts.isEmpty() && tombRenamePlan.nameUpdates.isEmpty())
+    val livePlan = VaultLogic.planWatchMerge(mapOf(callKey to "Asha"), listOf(renamedCall))
+    check("watch merge without the tombstone still renames as before",
+        livePlan.nameUpdates == listOf(renamedCall))
+}
+
+fun testProviderDeleteSpec() {
+    println("== provider delete spec (v1.2.0 vault and phone log flavor) ==")
+    val formatted = rec(number = "+91 90000 00010")
+    val spec = VaultLogic.providerDeleteSpec(formatted)
+    check("selection matches number, date and type",
+        spec.selection == "number = ? AND date = ? AND type = ?")
+    check("args are the normalized number, date and type",
+        spec.args == listOf("+919000000010", "1700000000000", "1"))
+    val local = rec(number = "0900000010", date = 1700003600000L, type = VaultLogic.TYPE_MISSED)
+    val localSpec = VaultLogic.providerDeleteSpec(local)
+    check("args follow the record",
+        localSpec.args == listOf("0900000010", "1700003600000", "3"))
+    check("selection has one placeholder per arg",
+        spec.selection.count { it == '?' } == spec.args.size)
+}
+
+fun testDeleteOutcomeText() {
+    println("== delete outcome text (v1.2.0) ==")
+    check("vault only, one entry",
+        VaultLogic.deleteOutcomeText(1, null) == "Removed 1 entry from the vault.")
+    check("vault only, several entries",
+        VaultLogic.deleteOutcomeText(4, null) == "Removed 4 entries from the vault.")
+    check("both flavors, both removed",
+        VaultLogic.deleteOutcomeText(1, 1) ==
+            "Removed 1 entry from the vault. Removed 1 entry from the phone log.")
+    check("both flavors, phone already missing the calls",
+        VaultLogic.deleteOutcomeText(3, 0) ==
+            "Removed 3 entries from the vault. No matching entries were in the phone log.")
+    check("both flavors, several phone rows",
+        VaultLogic.deleteOutcomeText(2, 2) ==
+            "Removed 2 entries from the vault. Removed 2 entries from the phone log.")
 }
 
 fun testFormatterConsistency() {
