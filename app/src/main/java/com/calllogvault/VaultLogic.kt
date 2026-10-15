@@ -571,9 +571,18 @@ object VaultLogic {
     }
 
     /** Subtitle of a person timeline row: relative day, time and short date. */
-    fun timelineSubtitle(dateMs: Long, nowMs: Long): String =
-        dateHeaderLabel(dateMs, nowMs) + "  ·  " + formatTime(dateMs) +
-            "  ·  " + formatDateTime(dateMs).substringBefore(",")
+    fun timelineSubtitle(dateMs: Long, nowMs: Long): String {
+        val label = dateHeaderLabel(dateMs, nowMs)
+        val base = label + "  ·  " + formatTime(dateMs)
+        // Today and Yesterday carry no date in the label, so append the
+        // short date. Older labels already are the full date; appending
+        // it again would print the date twice.
+        return if (label == "Today" || label == "Yesterday") {
+            base + "  ·  " + formatDateTime(dateMs).substringBefore(",")
+        } else {
+            base
+        }
+    }
 
     /**
      * Ellipsize [text] so its measured width fits [maxWidth], appending a
