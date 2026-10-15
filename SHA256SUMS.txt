@@ -1,1 +1,2 @@
 dc4de49f69631ed05d52a7a80992690781959cd64cfe3791faa45536fee22918  call-log-vault-v1.0.6.apk
+1b0b1b67a89f7e3b2d467ca062bb8d58e8dcfffc40a76572a3e9d29a5c71e020  call-log-vault-v1.0.7.apk
