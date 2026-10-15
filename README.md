@@ -21,14 +21,14 @@ Vibe coded by Arjun to solve his own problem, on his own S24 Ultra.
 - Search your entire history by name or number, filter by call type, see per-person timelines
 - Light, Dark and Auto themes (Auto follows your phone's own light and dark mode), with a switch to make Dark true black AMOLED
 
-- Manual delete when you want it: long press an entry in a person's timeline to remove it, or clear a whole number. The vault never deletes anything by itself, deleting is only ever your own tap
+- Manual delete when you want it: long press in a person's timeline to select one or many entries, then delete them from the vault only, or from the vault and the phone's call log together. A deleted call never comes back: the app keeps a scrambled fingerprint of it that syncs and imports check and refuse, and the fingerprint cannot be read back into a number. The vault never deletes anything by itself, deleting is only ever your own tap
 
 ## Why trust it
 
 - The app requests exactly 4 permissions: read call log, write call log (for restore), read contacts (to show names), and receive boot completed (so it restarts after a reboot). Nothing else. There is no internet permission to abuse
 - Every backup is a plain ZIP containing CSV, JSON and XML files. Your data is readable by normal tools, never locked into a weird format
-- Verify the download yourself. SHA-256 of the v1.1.0 APK:
-  `b6d94d90f331c1e42a5989a4f51b5047084a7e5a1199dafcf343fdd7f426e32a`
+- Verify the download yourself. SHA-256 of the v1.2.0 APK:
+  `0ff28b9c19e53ad101cc908a285d98de3dada0fa4b63d02b164850a5e6971386`
 - The full source code is in this repo (see below). Do not take anyone's word for what the app does, read it
 
 ## Install
