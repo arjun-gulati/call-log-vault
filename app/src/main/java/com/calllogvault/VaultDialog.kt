@@ -145,18 +145,29 @@ object VaultDialog {
         onPick: (Int) -> Unit
     ): Dialog {
         val list = LinearLayout(activity).apply { orientation = LinearLayout.VERTICAL }
+        // The rows are built before the dialog exists (show() creates
+        // it), so the click goes through a late reference, the same
+        // pattern deleteConfirm uses. Picking a row dismisses first,
+        // then calls onPick, as documented above: without the dismiss
+        // the dialog stayed open on the stale radio state and the
+        // pick only became visible after the user backed out
+        // (GitHub issue #4, Backup schedule).
+        var dialog: Dialog? = null
         for ((index, label) in labels.withIndex()) {
             list.addView(choiceRow(activity, label, index == selectedIndex) {
+                dialog?.dismiss()
                 onPick(index)
             })
         }
-        return show(
+        val built = show(
             activity, title, null, list,
             positiveLabel = null, onPositive = null,
             negativeLabel = "Cancel", onNegative = null,
             positiveDestructive = false, negativeDestructive = false,
             cancelable = true
         )
+        dialog = built
+        return built
     }
 
     /**
