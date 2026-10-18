@@ -1,7 +1,9 @@
 package com.calllogvault
 
+import android.animation.Animator
 import android.animation.AnimatorListenerAdapter
 import android.animation.ObjectAnimator
+import android.animation.ValueAnimator
 import android.app.Activity
 import android.content.Context
 import android.content.Intent
@@ -16,9 +18,12 @@ import android.text.Editable
 import android.text.TextWatcher
 import android.view.Gravity
 import android.view.HapticFeedbackConstants
+import android.view.MotionEvent
 import android.view.View
+import android.view.ViewConfiguration
 import android.view.ViewGroup
 import android.view.animation.DecelerateInterpolator
+import android.view.animation.LinearInterpolator
 import android.widget.BaseAdapter
 import android.widget.Button
 import android.widget.EditText
@@ -98,6 +103,23 @@ class MainActivity : Activity() {
     private var syncing = false
     private var syncStartedMs = 0L
     private var loadingVault = false
+
+    // Pull to refresh (v1.2.3, GitHub issue #5). One state machine
+    // plus one chip for the list that backs both the Call log and
+    // the People page; the gesture and visuals live further down,
+    // next to the sync section they feed. v1.2.4 adds the state
+    // label under the chip and result reporting for pull syncs.
+    private lateinit var pullMachine: PullRefreshMachine
+    private lateinit var pullBox: LinearLayout
+    private lateinit var pullChip: FrameLayout
+    private lateinit var pullChipIcon: ImageView
+    private lateinit var pullLabel: TextView
+    private var pullOffsetPx = 0f
+    private var pullAnim: ValueAnimator? = null
+    private var pullAnimToken = 0
+    private var pullSpin: ObjectAnimator? = null
+    private val pullSettleHandler = Handler(Looper.getMainLooper())
+    private var pullSettleStartMs = 0L
 
     /**
      * Vault snapshot from the last full apply: the pair the no-change
@@ -257,6 +279,10 @@ class MainActivity : Activity() {
         // A debounced search rebuild must not outlive the activity.
         searchRunnable?.let { searchHandler.removeCallbacks(it) }
         searchRunnable = null
+        // Neither may the pull to refresh settle watch or its animators.
+        pullSettleHandler.removeCallbacks(pullSettleCheck)
+        pullAnim?.cancel()
+        pullSpin?.cancel()
         super.onDestroy()
     }
 
@@ -429,6 +455,57 @@ class MainActivity : Activity() {
         permPanel = buildPermPanel()
         permPanel.visibility = View.GONE
         listArea.addView(permPanel)
+
+        // Pull to refresh chip (v1.2.3, GitHub issue #5): a small
+        // circular reload badge that slides in over the top of the
+        // list while the finger pulls. It rests fully above the list
+        // area and is clipped by it, so it appears to emerge from
+        // under the chips row. Every color comes from the theme
+        // palette, so light, dark and AMOLED all agree.
+        //
+        // v1.2.4: the chip rides in a small vertical box with a
+        // state label under it (Pull to sync / Release to sync /
+        // Syncing…), so the pull says what it is doing instead of
+        // only spinning. The label's words come from
+        // pullStateLabel(); the machine is the only source.
+        pullChipIcon = ImageView(this).apply {
+            setImageResource(R.drawable.ic_nav_sync)
+            setColorFilter(color(R.color.tile_icon))
+            setPadding(dp(9), dp(9), dp(9), dp(9))
+        }
+        pullChip = FrameLayout(this).apply {
+            background = GradientDrawable().apply {
+                shape = GradientDrawable.OVAL
+                setColor(color(R.color.card))
+            }
+            elevation = dp(4).toFloat()
+            addView(pullChipIcon, FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.MATCH_PARENT))
+        }
+        pullLabel = TextView(this).apply {
+            textSize = 12f
+            setTextColor(color(R.color.muted))
+            gravity = Gravity.CENTER
+        }
+        pullBox = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER_HORIZONTAL
+            alpha = 0f
+            visibility = View.GONE
+            addView(pullChip, LinearLayout.LayoutParams(
+                dp(PULL_CHIP_DP), dp(PULL_CHIP_DP)))
+            addView(pullLabel, LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply { topMargin = dp(2) })
+        }
+        listArea.addView(pullBox, FrameLayout.LayoutParams(
+            FrameLayout.LayoutParams.WRAP_CONTENT,
+            FrameLayout.LayoutParams.WRAP_CONTENT,
+            Gravity.TOP or Gravity.CENTER_HORIZONTAL))
+        installPullToRefresh()
+
         content.addView(listArea, LinearLayout.LayoutParams(
             LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f))
 
@@ -1236,6 +1313,269 @@ class MainActivity : Activity() {
         refresh(silent = false)
     }
 
+    // ------------------------------------------------------- Pull to sync
+
+    /**
+     * Pull to refresh on the main list (v1.2.3, GitHub issue #5).
+     * The one ListView backs both the Call log and the People page
+     * (setMode only flips peopleMode), so a single install covers
+     * both. The gesture can only start at the very top of the list
+     * and only on a clearly downward finger; [PullRefreshMachine]
+     * makes every arming and triggering decision. Events the pull
+     * does not claim are never consumed, so row taps, long presses
+     * and ordinary scrolling behave exactly as before. The sync the
+     * pull starts is the ordinary [refresh] entry point, the same
+     * one Sync now reaches through [manualSync]; there is no second
+     * sync pipeline and no second in-flight flag.
+     */
+    private fun installPullToRefresh() {
+        pullMachine = PullRefreshMachine(dp(PULL_ARM_DP).toFloat())
+        val slop = ViewConfiguration.get(this).scaledTouchSlop
+        var tracking = false
+        var engaged = false
+        var wasArmed = false
+        var startX = 0f
+        var startY = 0f
+        listView.setOnTouchListener { _, e ->
+            when (e.actionMasked) {
+                MotionEvent.ACTION_DOWN -> {
+                    tracking = !pullMachine.isRefreshing && listAtTop()
+                    engaged = false
+                    wasArmed = false
+                    startX = e.x
+                    startY = e.y
+                    // A fresh touch at the top restarts any settle
+                    // spring still running from the last gesture, so
+                    // the list never drifts under the finger.
+                    if (tracking && pullAnim != null) {
+                        animatePullOffsetTo(0f) { pullBox.visibility = View.GONE }
+                    }
+                    false
+                }
+                MotionEvent.ACTION_MOVE -> {
+                    if (!tracking) return@setOnTouchListener false
+                    val dx = e.x - startX
+                    val dy = e.y - startY
+                    if (!engaged) {
+                        when {
+                            dy > slop && dy > kotlin.math.abs(dx) * 1.2f -> {
+                                engaged = pullMachine.beginPull()
+                                if (!engaged) {
+                                    tracking = false
+                                    return@setOnTouchListener false
+                                }
+                                // The pull owns the gesture from here:
+                                // stop any offset spring and follow the
+                                // finger directly.
+                                pullAnimToken++
+                                pullAnim?.cancel()
+                                pullAnim = null
+                                // The list saw the finger down but will
+                                // see nothing more of this gesture: hand
+                                // its own touch handling a cancel so the
+                                // pressed row state and its pending tap
+                                // checks reset instead of sticking.
+                                val cancelEvent = MotionEvent.obtain(
+                                    e.downTime, e.eventTime,
+                                    MotionEvent.ACTION_CANCEL, e.x, e.y, 0
+                                )
+                                listView.onTouchEvent(cancelEvent)
+                                cancelEvent.recycle()
+                            }
+                            kotlin.math.abs(dx) > slop && kotlin.math.abs(dx) >= dy -> {
+                                // Horizontal drift wins: this gesture is
+                                // a scroll or a swipe elsewhere, and the
+                                // pull lets go of it completely.
+                                tracking = false
+                                return@setOnTouchListener false
+                            }
+                            else -> return@setOnTouchListener false
+                        }
+                    }
+                    pullMachine.updatePull(dy)
+                    if (pullMachine.isArmed && !wasArmed) {
+                        listView.performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY)
+                    }
+                    wasArmed = pullMachine.isArmed
+                    applyPullOffset(dampedPullOffset(dy))
+                    renderPullGlyph()
+                    renderPullLabel()
+                    true
+                }
+                MotionEvent.ACTION_UP -> {
+                    if (!engaged) {
+                        tracking = false
+                        return@setOnTouchListener false
+                    }
+                    tracking = false
+                    engaged = false
+                    // Consumed, so the release cannot also land as a
+                    // row tap after a pull.
+                    if (pullMachine.release()) startPullRefresh() else settlePullVisual()
+                    true
+                }
+                MotionEvent.ACTION_CANCEL -> {
+                    if (!engaged) {
+                        tracking = false
+                        return@setOnTouchListener false
+                    }
+                    tracking = false
+                    engaged = false
+                    pullMachine.cancel()
+                    settlePullVisual()
+                    true
+                }
+                else -> false
+            }
+        }
+    }
+
+    /** True only when the list is showing its very first row at its top. */
+    private fun listAtTop(): Boolean {
+        if (listView.visibility != View.VISIBLE) return false
+        if (listView.firstVisiblePosition != 0) return false
+        val first = listView.getChildAt(0) ?: return true
+        return first.top >= listView.paddingTop
+    }
+
+    /**
+     * Display offset for a finger travel: the list trails the finger
+     * at a little over half speed and stops a short way past the
+     * arming threshold, so the pull feels elastic, never 1:1 stiff.
+     */
+    private fun dampedPullOffset(dy: Float): Float {
+        if (dy <= 0f) return 0f
+        val cap = dp(PULL_ARM_DP).toFloat() * 1.5f
+        return (dy * 0.55f).coerceAtMost(cap)
+    }
+
+    /** The glyph winds up with pull progress and lights up when armed. */
+    private fun renderPullGlyph() {
+        pullChipIcon.rotation = 300f * pullMachine.progress
+        pullChipIcon.setColorFilter(
+            color(if (pullMachine.isArmed) R.color.primary else R.color.tile_icon)
+        )
+    }
+
+    /**
+     * The words under the chip track the machine (v1.2.4): they flip
+     * the moment a pull arms or disarms, and read Syncing… while the
+     * sync runs. The mapping itself is pure and tested
+     * ([pullStateLabel]); this only renders it.
+     */
+    private fun renderPullLabel() {
+        pullLabel.text = pullStateLabel(pullMachine.state) ?: ""
+    }
+
+    /**
+     * Move everything the pull moves: the list and the empty state
+     * slide together, the chip box rides the same offset in from
+     * above the list area. Called by the finger and by the offset
+     * animator. The box (chip over its label) is exactly the hold
+     * height when laid out, so at the settle offset the whole box
+     * sits in the space the list slid away from.
+     */
+    private fun applyPullOffset(offsetPx: Float) {
+        pullOffsetPx = offsetPx
+        listView.translationY = offsetPx
+        emptyView.translationY = offsetPx
+        val boxH = if (pullBox.height > 0) pullBox.height.toFloat()
+            else dp(PULL_BOX_FALLBACK_DP).toFloat()
+        pullBox.translationY = offsetPx - boxH
+        if (offsetPx > 0f || pullMachine.isRefreshing) {
+            if (pullBox.visibility != View.VISIBLE) pullBox.visibility = View.VISIBLE
+            pullBox.alpha = if (pullMachine.isRefreshing) 1f
+                else (offsetPx / dp(PULL_HOLD_DP).toFloat()).coerceIn(0f, 1f)
+        } else {
+            pullBox.alpha = 0f
+            pullBox.visibility = View.GONE
+        }
+    }
+
+    /**
+     * Spring the pull offset to [targetPx]. A generation token keeps
+     * a superseded spring's end action from firing after a newer
+     * gesture or animation has taken over the offset.
+     */
+    private fun animatePullOffsetTo(targetPx: Float, endAction: (() -> Unit)? = null) {
+        val token = ++pullAnimToken
+        pullAnim?.cancel()
+        val anim = ValueAnimator.ofFloat(pullOffsetPx, targetPx)
+        anim.duration = PULL_ANIM_MS
+        anim.interpolator = DecelerateInterpolator()
+        anim.addUpdateListener { applyPullOffset(it.animatedValue as Float) }
+        anim.addListener(object : AnimatorListenerAdapter() {
+            override fun onAnimationEnd(animation: Animator) {
+                if (pullAnim === anim) pullAnim = null
+                if (token == pullAnimToken) endAction?.invoke()
+            }
+        })
+        pullAnim = anim
+        anim.start()
+    }
+
+    /**
+     * An armed pull was released: run the sync. Silent about
+     * progress, because the chip is the progress UI (no dialog), but
+     * v1.2.4 asks refresh() to report the result: a spinner alone
+     * never told Arjun whether the sync had actually happened. If a
+     * sync is already in flight, refresh() leaves it alone and
+     * reports nothing for this call (the originator reports its own
+     * result), and the chip simply mirrors that sync through the
+     * settle watch below until the shared [syncing] flag clears.
+     */
+    private fun startPullRefresh() {
+        pullChipIcon.setColorFilter(color(R.color.primary))
+        pullSpin?.cancel()
+        pullSpin = ObjectAnimator.ofFloat(pullChipIcon, "rotation", 0f, 360f).apply {
+            duration = 850
+            repeatCount = ObjectAnimator.INFINITE
+            interpolator = LinearInterpolator()
+            start()
+        }
+        renderPullLabel()
+        animatePullOffsetTo(dp(PULL_HOLD_DP).toFloat())
+        refresh(silent = true, reportResult = true)
+        pullSettleStartMs = System.currentTimeMillis()
+        pullSettleHandler.removeCallbacks(pullSettleCheck)
+        pullSettleHandler.postDelayed(pullSettleCheck, PULL_SETTLE_POLL_MS)
+    }
+
+    /**
+     * Settle watch: poll the shared sync flag until it clears, then
+     * put the chip away. The minimum spin keeps a very fast sync
+     * from flashing the chip, and the hard cap means the indicator
+     * can never spin forever, whatever the sync does.
+     */
+    private val pullSettleCheck = object : Runnable {
+        override fun run() {
+            val waited = System.currentTimeMillis() - pullSettleStartMs
+            if ((!syncing && waited >= PULL_MIN_SPIN_MS) || waited > PULL_SETTLE_CAP_MS) {
+                settlePullAfterRefresh()
+            } else {
+                pullSettleHandler.postDelayed(this, PULL_SETTLE_POLL_MS)
+            }
+        }
+    }
+
+    private fun settlePullAfterRefresh() {
+        if (!pullMachine.syncSettled()) return
+        pullSpin?.cancel()
+        pullSpin = null
+        pullChipIcon.rotation = 0f
+        renderPullLabel()
+        animatePullOffsetTo(0f) {
+            pullBox.visibility = View.GONE
+            pullChipIcon.setColorFilter(color(R.color.tile_icon))
+        }
+    }
+
+    /** An unarmed release or a cancelled pull: spring back, nothing runs. */
+    private fun settlePullVisual() {
+        renderPullLabel()
+        animatePullOffsetTo(0f) { pullBox.visibility = View.GONE }
+    }
+
     /**
      * Sync entry point. Wedge proof: in v1.0.1 the background thread had
      * no try/finally, so any throw before its UI post left [syncing]
@@ -1255,8 +1595,19 @@ class MainActivity : Activity() {
      * full rebuild entirely (VaultLogic.shouldApplyRebuild against
      * the snapshot from the last apply): no grouping, no item build,
      * no notifyDataSetChanged, just the last sync text and toasts.
+     *
+     * v1.2.4: progress and result are separate switches. [silent]
+     * still owns progress (the dialog; the pull chip covers it for
+     * the pull path), while [reportResult] owns the completion
+     * toast. It defaults to following [silent], so every existing
+     * caller behaves exactly as before; the pull passes it
+     * explicitly, because its verdict was that a silent spinner
+     * never proved a sync happened. A call that finds a sync
+     * already running returns above without starting anything, so
+     * it can never report: only the originator does
+     * ([shouldReportSyncResult]).
      */
-    private fun refresh(silent: Boolean) {
+    private fun refresh(silent: Boolean, reportResult: Boolean = !silent) {
         if (!PermUtil.hasCallLogRead(this)) return
         if (syncing) {
             val ageMs = System.currentTimeMillis() - syncStartedMs
@@ -1269,6 +1620,12 @@ class MainActivity : Activity() {
         }
         syncing = true
         syncStartedMs = System.currentTimeMillis()
+        // Reaching this line means THIS call starts the sync (the
+        // already running path returned), so it owns the result
+        // report whenever one was requested.
+        val report = shouldReportSyncResult(
+            startedByThisCall = true, reportRequested = reportResult
+        )
         val progress = if (silent) null else showProgress("Syncing calls")
         if (progress != null) {
             // Hard cap on the dialog: it can never spin forever. If the
@@ -1332,11 +1689,11 @@ class MainActivity : Activity() {
                         } else {
                             "Not yet"
                         }
-                        if (result.error != null && !silent) {
+                        if (result.error != null && report) {
                             toast(result.error)
                         }
-                        if (!silent && result.error == null) {
-                            toast("Sync done: " + result.added + " new calls saved")
+                        if (report && result.error == null) {
+                            toast(syncDoneMessage(result.added))
                         }
                     }
                 } else {
@@ -1352,17 +1709,17 @@ class MainActivity : Activity() {
                         // The list may already be populated by loadVaultOnly:
                         // this is simply the second, fresher update.
                         applyVaultData(records, peopleList, built, oldest, totalDur, sysCount)
-                        if (result.error != null && !silent) {
+                        if (result.error != null && report) {
                             toast(result.error)
                         }
-                        if (!silent && result.error == null) {
-                            toast("Sync done: " + result.added + " new calls saved")
+                        if (report && result.error == null) {
+                            toast(syncDoneMessage(result.added))
                         }
                     }
                 }
             } catch (e: Exception) {
                 SyncEngine.recordSyncError(this, e.message ?: "Sync failed")
-                if (!silent) {
+                if (report) {
                     runOnUiThread {
                         toast("Sync failed: " + (e.message ?: "unknown error"))
                     }
@@ -2010,6 +2367,16 @@ class MainActivity : Activity() {
         const val SUPPORT_URL = "https://viewing-graphs-requests-peaceful.trycloudflare.com/"
         private const val SYNC_WEDGE_MS = 120_000L
         private const val SYNC_DIALOG_CAP_MS = 30_000L
+        private const val PULL_ARM_DP = 72
+        private const val PULL_HOLD_DP = 56
+        private const val PULL_CHIP_DP = 38
+        // Chip (38) + label gap (2) + one label line (16): the pull
+        // box height before its first layout measures it for real.
+        private const val PULL_BOX_FALLBACK_DP = 56
+        private const val PULL_ANIM_MS = 220L
+        private const val PULL_SETTLE_POLL_MS = 120L
+        private const val PULL_MIN_SPIN_MS = 450L
+        private const val PULL_SETTLE_CAP_MS = 135_000L
         private const val SEARCH_DEBOUNCE_MS = 120L
         private const val REQ_PERMISSIONS = 100
         private const val REQ_EXPORT = 2001

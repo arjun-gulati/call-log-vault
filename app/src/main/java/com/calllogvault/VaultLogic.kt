@@ -1160,3 +1160,134 @@ object VaultLogic {
         return out
     }
 }
+
+/**
+ * Pull to refresh state machine (v1.2.3, GitHub issue #5). Pure:
+ * the view layer feeds finger travel in pixels and renders from
+ * [state] and [progress]; every decision (when a pull arms, when a
+ * release triggers, why a second pull can never double trigger)
+ * lives here so the JVM tests pin it without Android.
+ *
+ * Distances are raw finger travel from the pull start. The view
+ * applies its own damping for display, so arming tracks the real
+ * gesture, not the eased pixels on screen.
+ */
+class PullRefreshMachine(private val armThresholdPx: Float) {
+
+    init {
+        require(armThresholdPx > 0f) { "arm threshold must be positive" }
+    }
+
+    enum class State { IDLE, PULLING, ARMED, REFRESHING }
+
+    var state: State = State.IDLE
+        private set
+
+    /** Progress toward arming: 0 at rest, 1 at the threshold. */
+    var progress: Float = 0f
+        private set
+
+    val isArmed: Boolean get() = state == State.ARMED
+    val isRefreshing: Boolean get() = state == State.REFRESHING
+
+    /**
+     * A finger started pulling at the top of the list. Refused
+     * while a sync is refreshing (a pull must never double trigger)
+     * or while a pull is already being tracked.
+     */
+    fun beginPull(): Boolean {
+        if (state != State.IDLE) return false
+        state = State.PULLING
+        progress = 0f
+        return true
+    }
+
+    /**
+     * The finger moved; [dyPx] is its downward travel from the pull
+     * start. Travel back above the start reads as zero. Arming is
+     * exact: at or beyond the threshold the pull is armed, and
+     * slipping back below the threshold disarms it again.
+     */
+    fun updatePull(dyPx: Float): State {
+        if (state != State.PULLING && state != State.ARMED) return state
+        val clamped = if (dyPx > 0f) dyPx else 0f
+        progress = (clamped / armThresholdPx).coerceAtMost(1f)
+        state = if (clamped >= armThresholdPx) State.ARMED else State.PULLING
+        return state
+    }
+
+    /**
+     * The finger lifted. From ARMED the refresh starts and this
+     * returns true, exactly once; from PULLING the pull just
+     * settles. In REFRESHING a release can never retrigger.
+     */
+    fun release(): Boolean {
+        return when (state) {
+            State.ARMED -> {
+                state = State.REFRESHING
+                progress = 1f
+                true
+            }
+            State.PULLING -> {
+                state = State.IDLE
+                progress = 0f
+                false
+            }
+            else -> false
+        }
+    }
+
+    /**
+     * The gesture was cancelled (horizontal drift won, the touch
+     * stream ended, the list took the gesture back). Pulling states
+     * settle to idle. A running refresh is untouched: only
+     * [syncSettled] ends it.
+     */
+    fun cancel(): Boolean {
+        if (state == State.PULLING || state == State.ARMED) {
+            state = State.IDLE
+            progress = 0f
+            return true
+        }
+        return false
+    }
+
+    /** The sync the indicator reflects has finished; settle. */
+    fun syncSettled(): Boolean {
+        if (state != State.REFRESHING) return false
+        state = State.IDLE
+        progress = 0f
+        return true
+    }
+}
+
+/**
+ * The words shown under the pull chip for each machine state
+ * (v1.2.4). v1.2.3 shipped the gesture with only a spinning chip,
+ * and the on-device verdict was that a spinner never says whether
+ * a sync actually happened, so the pull narrates itself now. IDLE
+ * has no label: the chip is off screen then too.
+ */
+fun pullStateLabel(state: PullRefreshMachine.State): String? = when (state) {
+    PullRefreshMachine.State.IDLE -> null
+    PullRefreshMachine.State.PULLING -> "Pull to sync"
+    PullRefreshMachine.State.ARMED -> "Release to sync"
+    PullRefreshMachine.State.REFRESHING -> "Syncing…"
+}
+
+/**
+ * Whether a sync completion may be surfaced to the user (v1.2.4):
+ * only the caller that actually started the sync reports it, and
+ * only when it asked to. A pull that latched onto a sync someone
+ * else started stays quiet, so the originator's report is the only
+ * one; silent auto syncs never report at all.
+ */
+fun shouldReportSyncResult(startedByThisCall: Boolean, reportRequested: Boolean): Boolean =
+    startedByThisCall && reportRequested
+
+/**
+ * The one completion line for a finished sync (v1.2.4): what Sync
+ * now has always said on success, now built in exactly one place
+ * so the manual and pull paths can never drift apart.
+ */
+fun syncDoneMessage(added: Int): String = "Sync done: " + added + " new calls saved"
