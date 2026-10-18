@@ -1,4 +1,8 @@
+import com.calllogvault.PullRefreshMachine
 import com.calllogvault.VaultLogic
+import com.calllogvault.pullStateLabel
+import com.calllogvault.shouldReportSyncResult
+import com.calllogvault.syncDoneMessage
 
 var failures = 0
 var checks = 0
@@ -54,6 +58,8 @@ fun main() {
     testRowDisplayStrings()
     testEllipsize()
     testShouldApplyRebuild()
+    testPullRefresh()
+    testPullFeedback()
     println("CHECKS=$checks FAILURES=$failures")
     println(if (failures == 0) "ALL_VAULT_TESTS_PASSED" else "VAULT_TEST_FAILURES=$failures")
     if (failures > 0) kotlin.system.exitProcess(1)
@@ -709,4 +715,110 @@ fun testDurationFormat() {
     check("minutes", VaultLogic.formatDuration(65) == "1m 05s")
     check("hours", VaultLogic.formatDuration(3661) == "1h 01m")
     check("negative clamps", VaultLogic.formatDuration(-5) == "0s")
+}
+
+fun near(actual: Float, expected: Float): Boolean = kotlin.math.abs(actual - expected) < 0.001f
+
+fun testPullRefresh() {
+    val idle = PullRefreshMachine.State.IDLE
+    val pulling = PullRefreshMachine.State.PULLING
+    val armed = PullRefreshMachine.State.ARMED
+    val refreshing = PullRefreshMachine.State.REFRESHING
+
+    // A fresh machine is at rest, and stray events change nothing.
+    val m = PullRefreshMachine(100f)
+    check("pull: fresh machine is idle", m.state == idle && near(m.progress, 0f))
+    check("pull: move before begin is ignored", m.updatePull(150f) == idle && near(m.progress, 0f))
+    check("pull: release before begin does not trigger", !m.release() && m.state == idle)
+    check("pull: cancel before begin is a no-op", !m.cancel() && m.state == idle)
+    check("pull: settle before begin is a no-op", !m.syncSettled() && m.state == idle)
+
+    // Arming: progress tracks travel, the threshold arms exactly.
+    check("pull: begin starts the pull", m.beginPull() && m.state == pulling)
+    check("pull: a second begin is refused", !m.beginPull() && m.state == pulling)
+    check("pull: 40 of 100 is pulling at 0.4", m.updatePull(40f) == pulling && near(m.progress, 0.4f))
+    check("pull: just under the threshold stays unarmed", m.updatePull(99f) == pulling && !m.isArmed)
+    check("pull: at the threshold the pull arms", m.updatePull(100f) == armed && m.isArmed)
+    check("pull: past the threshold progress clamps at 1", m.updatePull(260f) == armed && near(m.progress, 1f))
+    check("pull: slipping back below disarms", m.updatePull(50f) == pulling && near(m.progress, 0.5f))
+    check("pull: travel above the start reads as zero", m.updatePull(-30f) == pulling && near(m.progress, 0f))
+
+    // Release without arming settles quietly, no trigger.
+    check("pull: unarmed release does not trigger", !m.release() && m.state == idle && near(m.progress, 0f))
+
+    // Cancel paths from both pulling states.
+    check("pull: begin again after settle", m.beginPull())
+    check("pull: cancel from pulling settles", m.cancel() && m.state == idle)
+    check("pull: begin for the armed cancel", m.beginPull())
+    m.updatePull(140f)
+    check("pull: cancel from armed settles without triggering",
+        m.state == armed && m.cancel() && m.state == idle && !m.isRefreshing)
+
+    // The armed release triggers exactly once.
+    check("pull: begin for the trigger", m.beginPull())
+    m.updatePull(100f)
+    check("pull: armed release triggers", m.release() && m.state == refreshing && m.isRefreshing)
+    check("pull: refreshing holds progress at full", near(m.progress, 1f))
+    check("pull: a second release cannot double trigger", !m.release() && m.state == refreshing)
+    check("pull: a new pull cannot begin while refreshing", !m.beginPull() && m.state == refreshing)
+    check("pull: finger moves are ignored while refreshing", m.updatePull(200f) == refreshing)
+    check("pull: a gesture cancel cannot end a refresh", !m.cancel() && m.state == refreshing)
+
+    // Settle returns to rest and the whole cycle can repeat.
+    check("pull: sync settle ends the refresh", m.syncSettled() && m.state == idle && near(m.progress, 0f))
+    check("pull: a second settle is a no-op", !m.syncSettled() && m.state == idle)
+    check("pull: a fresh pull works after settle", m.beginPull() && m.updatePull(120f) == armed)
+    check("pull: the second cycle triggers too", m.release() && m.state == refreshing)
+    check("pull: the second cycle settles too", m.syncSettled() && m.state == idle)
+
+    // The production threshold (72dp in px at any density) behaves
+    // the same: arm exactly at it, not a hair before.
+    val prod = PullRefreshMachine(216f)
+    prod.beginPull()
+    check("pull: 215 of 216 is not armed", prod.updatePull(215f) == pulling)
+    check("pull: 216 of 216 arms", prod.updatePull(216f) == armed)
+    check("pull: half travel is half progress", prod.updatePull(108f) == pulling && near(prod.progress, 0.5f))
+}
+
+fun testPullFeedback() {
+    val idle = PullRefreshMachine.State.IDLE
+    val pulling = PullRefreshMachine.State.PULLING
+    val armed = PullRefreshMachine.State.ARMED
+    val refreshing = PullRefreshMachine.State.REFRESHING
+
+    // The label mapping: one line per state, nothing at rest (v1.2.4).
+    check("label: idle has no label", pullStateLabel(idle) == null)
+    check("label: pulling invites", pullStateLabel(pulling) == "Pull to sync")
+    check("label: armed says release", pullStateLabel(armed) == "Release to sync")
+    check("label: refreshing says syncing", pullStateLabel(refreshing) == "Syncing…")
+
+    // The label tracks the machine live, including the disarm flip:
+    // the words change the moment the finger crosses the threshold
+    // in either direction, and settle back to nothing at rest.
+    val m = PullRefreshMachine(100f)
+    check("label: rest before the pull", pullStateLabel(m.state) == null)
+    m.beginPull()
+    check("label: a fresh pull invites", pullStateLabel(m.state) == "Pull to sync")
+    m.updatePull(99f)
+    check("label: just under the line still invites", pullStateLabel(m.state) == "Pull to sync")
+    m.updatePull(100f)
+    check("label: at the line it flips to release", pullStateLabel(m.state) == "Release to sync")
+    m.updatePull(40f)
+    check("label: slipping back flips it back", pullStateLabel(m.state) == "Pull to sync")
+    m.updatePull(160f)
+    check("label: release starts the sync words", m.release() && pullStateLabel(m.state) == "Syncing…")
+    check("label: settle clears the words", m.syncSettled() && pullStateLabel(m.state) == null)
+
+    // The popup rule: only a caller that started its sync, and
+    // asked for the result, may report it. A pull latched onto a
+    // running sync started nothing, so it stays quiet even though
+    // it asked; silent auto syncs started theirs but never asked.
+    check("report: pull started and asked reports", shouldReportSyncResult(true, true))
+    check("report: latched pull stays quiet", !shouldReportSyncResult(false, true))
+    check("report: silent auto sync stays quiet", !shouldReportSyncResult(true, false))
+    check("report: neither started nor asked stays quiet", !shouldReportSyncResult(false, false))
+
+    // The completion line is the manual flow's own words, exactly.
+    check("report: done line for an up to date vault", syncDoneMessage(0) == "Sync done: 0 new calls saved")
+    check("report: done line counts the new calls", syncDoneMessage(7) == "Sync done: 7 new calls saved")
 }
