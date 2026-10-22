@@ -1,6 +1,9 @@
 import com.calllogvault.PullRefreshMachine
+import com.calllogvault.ScrollToTopMachine
 import com.calllogvault.VaultLogic
 import com.calllogvault.pullStateLabel
+import com.calllogvault.scrollToTopDurationMs
+import com.calllogvault.scrollToTopLabel
 import com.calllogvault.shouldReportSyncResult
 import com.calllogvault.syncDoneMessage
 
@@ -60,6 +63,10 @@ fun main() {
     testShouldApplyRebuild()
     testPullRefresh()
     testPullFeedback()
+    testPageTitlesAndScrollStates()
+    testScrollToTop()
+    testBin()
+    testPause()
     println("CHECKS=$checks FAILURES=$failures")
     println(if (failures == 0) "ALL_VAULT_TESTS_PASSED" else "VAULT_TEST_FAILURES=$failures")
     if (failures > 0) kotlin.system.exitProcess(1)
@@ -821,4 +828,335 @@ fun testPullFeedback() {
     // The completion line is the manual flow's own words, exactly.
     check("report: done line for an up to date vault", syncDoneMessage(0) == "Sync done: 0 new calls saved")
     check("report: done line counts the new calls", syncDoneMessage(7) == "Sync done: 7 new calls saved")
+}
+
+fun testPageTitlesAndScrollStates() {
+    println("== page titles and scroll states ==")
+    check("title: call log page", VaultLogic.mainPageTitle(false) == "Call Logs")
+    check("title: people page", VaultLogic.mainPageTitle(true) == "People")
+
+    val top = VaultLogic.pageScrollState(0, 0)
+    check("scroll state: top is preserved", top == VaultLogic.PageScrollState(0, 0))
+    check(
+        "scroll state: a partly scrolled row keeps its negative offset",
+        VaultLogic.pageScrollState(12, -18) == VaultLogic.PageScrollState(12, -18)
+    )
+    check(
+        "scroll state: negative positions and a missing row are sanitized",
+        VaultLogic.pageScrollState(-4, null) == VaultLogic.PageScrollState(0, 0)
+    )
+    check(
+        "scroll state: restore clamps beyond the end of a shorter list",
+        VaultLogic.restoredPageScrollState(VaultLogic.PageScrollState(90, -8), 25) ==
+            VaultLogic.PageScrollState(24, -8)
+    )
+    check(
+        "scroll state: restore into an empty list returns to the top",
+        VaultLogic.restoredPageScrollState(VaultLogic.PageScrollState(90, -8), 0) ==
+            VaultLogic.PageScrollState()
+    )
+    check(
+        "scroll state: restore keeps a valid position",
+        VaultLogic.restoredPageScrollState(VaultLogic.PageScrollState(7, -3), 25) ==
+            VaultLogic.PageScrollState(7, -3)
+    )
+
+    check("top test: first row at the padding is the top", VaultLogic.isAtTop(0, 12, 12))
+    check("top test: first row below the padding is the top", VaultLogic.isAtTop(0, 16, 12))
+    check("top test: a partly scrolled first row is not the top", !VaultLogic.isAtTop(0, 4, 12))
+    check("top test: any later first row is not the top", !VaultLogic.isAtTop(1, 12, 12))
+    check("away test: the first row alone is not meaningfully away", !VaultLogic.isMeaningfullyAwayFromTop(0))
+    check("away test: one full row above is meaningfully away", VaultLogic.isMeaningfullyAwayFromTop(1))
+    check("away test: deep in the list is meaningfully away", VaultLogic.isMeaningfullyAwayFromTop(400))
+    check("away test: a bad position is not away", !VaultLogic.isMeaningfullyAwayFromTop(-1))
+
+    // v1.2.6: the pill's away test is a pixel estimate, not a bare
+    // adapter position, so one stale position read cannot latch it.
+    check("estimate: at the top is zero", VaultLogic.estimatedScrollPx(0, 12, 12, 80) == 0)
+    check(
+        "estimate: a partly scrolled first row counts its travel",
+        VaultLogic.estimatedScrollPx(0, -18, 12, 80) == 30
+    )
+    check(
+        "estimate: whole rows use the row height",
+        VaultLogic.estimatedScrollPx(3, 2, 12, 80) == 250
+    )
+    check("estimate: a bad position is zero", VaultLogic.estimatedScrollPx(-2, 0, 12, 80) == 0)
+    check(
+        "estimate: a missing row height still counts travel",
+        VaultLogic.estimatedScrollPx(0, -40, 0, 0) == 40
+    )
+    check("away px: any whole row above is away", VaultLogic.scrollToTopAwayPx(1, 12, 12, 80, 96))
+    check(
+        "away px: a short first row travel is not away",
+        !VaultLogic.scrollToTopAwayPx(0, -18, 12, 80, 96)
+    )
+    check(
+        "away px: deep first row travel is away",
+        VaultLogic.scrollToTopAwayPx(0, -120, 0, 200, 96)
+    )
+    check(
+        "away px: exactly at the threshold is away",
+        VaultLogic.scrollToTopAwayPx(0, -96, 0, 200, 96)
+    )
+    check(
+        "away px: a bad position is not away",
+        !VaultLogic.scrollToTopAwayPx(-1, 0, 0, 80, 96)
+    )
+
+    // v1.2.7: the fast scroll scrubber's fraction and index math.
+    // The fraction mirrors the list (0 at the top, 1 on the last
+    // page); the index maps a thumb fraction onto the whole list.
+    check("scrub fraction: the top is zero", VaultLogic.scrollFraction(0, 10, 100) == 0f)
+    check("scrub fraction: the last page is one", VaultLogic.scrollFraction(90, 10, 100) == 1f)
+    check("scrub fraction: mid travel is a half", VaultLogic.scrollFraction(45, 10, 100) == 0.5f)
+    check("scrub fraction: an empty list is zero", VaultLogic.scrollFraction(0, 10, 0) == 0f)
+    check("scrub fraction: a list that fits is zero", VaultLogic.scrollFraction(0, 10, 8) == 0f)
+    check("scrub fraction: no rows laid out is zero", VaultLogic.scrollFraction(5, 0, 100) == 0f)
+    check("scrub fraction: past the end clamps to one", VaultLogic.scrollFraction(95, 10, 100) == 1f)
+    check("scrub fraction: a bad position clamps to zero", VaultLogic.scrollFraction(-3, 10, 100) == 0f)
+    check("scrub index: fraction zero is the first row", VaultLogic.scrubIndexForFraction(0f, 100) == 0)
+    check("scrub index: fraction one is the last row", VaultLogic.scrubIndexForFraction(1f, 100) == 99)
+    check("scrub index: the middle lands mid list", VaultLogic.scrubIndexForFraction(0.5f, 101) == 50)
+    check("scrub index: below zero clamps to the first row", VaultLogic.scrubIndexForFraction(-0.5f, 100) == 0)
+    check("scrub index: above one clamps to the last row", VaultLogic.scrubIndexForFraction(1.5f, 100) == 99)
+    check("scrub index: an empty list is zero", VaultLogic.scrubIndexForFraction(0.5f, 0) == 0)
+    check("scrub index: a single row is zero", VaultLogic.scrubIndexForFraction(1f, 1) == 0)
+}
+
+fun testScrollToTop() {
+    println("== scroll to top ==")
+    val hidden = ScrollToTopMachine.State.HIDDEN
+    val ready = ScrollToTopMachine.State.READY
+    val returning = ScrollToTopMachine.State.RETURNING
+    val arrived = ScrollToTopMachine.State.ARRIVED
+
+    check("top label: hidden has no label", scrollToTopLabel(hidden) == null)
+    check("top label: ready invites", scrollToTopLabel(ready) == "↑ Top")
+    check("top label: returning narrates", scrollToTopLabel(returning) == "↑ Going up")
+    check("top label: arrived confirms", scrollToTopLabel(arrived) == "✓ At top")
+
+    val m = ScrollToTopMachine()
+    check("top machine: starts hidden", m.state == hidden)
+    check("top machine: a return cannot start while hidden", !m.startReturn() && m.state == hidden)
+    check("top machine: at the top it stays hidden", m.onPosition(awayFromTop = false, atTop = true) == hidden)
+    check("top machine: away from the top it becomes ready", m.onPosition(awayFromTop = true, atTop = false) == ready)
+    check("top machine: still away it stays ready", m.onPosition(awayFromTop = true, atTop = false) == ready)
+    check("top machine: scrolling home by hand hides it", m.onPosition(awayFromTop = false, atTop = true) == hidden)
+
+    check("top machine: away again readies it", m.onPosition(awayFromTop = true, atTop = false) == ready)
+    check("top machine: a tap starts the return", m.startReturn() && m.state == returning)
+    check("top machine: a second tap cannot restart it", !m.startReturn() && m.state == returning)
+    check("top machine: still travelling it keeps returning", m.onPosition(awayFromTop = true, atTop = false) == returning)
+    check("top machine: landing arrives", m.onPosition(awayFromTop = false, atTop = true) == arrived)
+    check("top machine: the top holds the arrived state", m.onPosition(awayFromTop = false, atTop = true) == arrived)
+    check("top machine: the arrived state finishes hidden", m.finishArrived() == hidden)
+    check("top machine: finishing twice is a no-op", m.finishArrived() == hidden)
+
+    // Scrolling away during the arrived beat retargets the button.
+    m.onPosition(awayFromTop = true, atTop = false)
+    m.startReturn()
+    m.onPosition(awayFromTop = false, atTop = true)
+    check("top machine: scrolling away from arrived readies it", m.onPosition(awayFromTop = true, atTop = false) == ready)
+
+    // Interruptions land back on whatever the list is really doing.
+    check("top machine: ready for the interrupt checks", m.startReturn() && m.state == returning)
+    check("top machine: an interrupt while away readies it", m.interrupt(awayFromTop = true, atTop = false) == ready)
+    check("top machine: return again after an interrupt", m.startReturn() && m.state == returning)
+    check("top machine: an interrupt at the top hides it", m.interrupt(awayFromTop = false, atTop = true) == hidden)
+    check("top machine: an interrupt while hidden changes nothing", m.interrupt(awayFromTop = true, atTop = false) == hidden)
+    check("top machine: reset hides a ready button", m.onPosition(awayFromTop = true, atTop = false) == ready && m.reset() == hidden)
+
+    check("top duration: the top itself gets the floor", scrollToTopDurationMs(0) == 450)
+    check("top duration: a bad position gets the floor", scrollToTopDurationMs(-20) == 450)
+    check("top duration: ten rows takes a little longer", scrollToTopDurationMs(10) == 570)
+    check("top duration: a huge list is capped", scrollToTopDurationMs(100000) == 1500)
+    check(
+        "top duration: longer lists never get less time",
+        scrollToTopDurationMs(40) >= scrollToTopDurationMs(20) &&
+            scrollToTopDurationMs(20) >= scrollToTopDurationMs(5)
+    )
+}
+
+/** One UTC wall clock moment as epoch millis (tests pin the default zone to UTC). */
+fun utcMs(year: Int, month0: Int, day: Int, hour: Int, minute: Int): Long {
+    val cal = java.util.Calendar.getInstance(java.util.TimeZone.getTimeZone("UTC"))
+    cal.set(year, month0, day, hour, minute, 0)
+    cal.set(java.util.Calendar.MILLISECOND, 0)
+    return cal.timeInMillis
+}
+
+fun testBin() {
+    println("== bin ==")
+    val day = 24L * 60 * 60 * 1000
+    val t0 = 1700000000000L
+    check("bin: a fresh row is not expired", !VaultLogic.isBinExpired(t0, t0))
+    check("bin: 29 days is not expired", !VaultLogic.isBinExpired(t0, t0 + 29 * day))
+    check("bin: a millisecond before 30 days is not expired", !VaultLogic.isBinExpired(t0, t0 + 30 * day - 1))
+    check("bin: exactly 30 days is expired", VaultLogic.isBinExpired(t0, t0 + 30 * day))
+    check("bin: 45 days is expired", VaultLogic.isBinExpired(t0, t0 + 45 * day))
+    check("bin: a future delete time is never expired", !VaultLogic.isBinExpired(t0 + day, t0))
+
+    check("bin days: 30 at the delete", VaultLogic.binDaysLeft(t0, t0) == 30)
+    check("bin days: still 30 an hour later", VaultLogic.binDaysLeft(t0, t0 + 3600000L) == 30)
+    check("bin days: 29 after a day and a bit", VaultLogic.binDaysLeft(t0, t0 + day + 3600000L) == 29)
+    check("bin days: 1 on the last day", VaultLogic.binDaysLeft(t0, t0 + 29 * day) == 1)
+    check("bin days: 1 near the end of the last day", VaultLogic.binDaysLeft(t0, t0 + 30 * day - 3600000L) == 1)
+    check("bin days: 0 once expired", VaultLogic.binDaysLeft(t0, t0 + 30 * day) == 0)
+    check("bin days: 0 long after expiry", VaultLogic.binDaysLeft(t0, t0 + 90 * day) == 0)
+    check("bin days: a future delete time clamps to 30", VaultLogic.binDaysLeft(t0 + day, t0) == 30)
+}
+
+fun testPause() {
+    println("== pause ==")
+    val hour = 60L * 60 * 1000
+    val day = 24L * hour
+    val t0 = 1700000000000L
+
+    check("pause end: one hour", VaultLogic.pauseEndForChoice(VaultLogic.PauseChoice.ONE_HOUR, t0) == t0 + hour)
+    check("pause end: four hours", VaultLogic.pauseEndForChoice(VaultLogic.PauseChoice.FOUR_HOURS, t0) == t0 + 4 * hour)
+
+    val today8 = utcMs(2026, 2, 10, 8, 0)
+    val tomorrow8 = utcMs(2026, 2, 11, 8, 0)
+    check(
+        "pause end: 07:59 until tomorrow is today 08:00",
+        VaultLogic.pauseEndForChoice(VaultLogic.PauseChoice.UNTIL_TOMORROW, utcMs(2026, 2, 10, 7, 59)) == today8
+    )
+    check(
+        "pause end: 08:00 sharp rolls to tomorrow 08:00",
+        VaultLogic.pauseEndForChoice(VaultLogic.PauseChoice.UNTIL_TOMORROW, utcMs(2026, 2, 10, 8, 0)) == tomorrow8
+    )
+    check(
+        "pause end: 08:01 is tomorrow 08:00",
+        VaultLogic.pauseEndForChoice(VaultLogic.PauseChoice.UNTIL_TOMORROW, utcMs(2026, 2, 10, 8, 1)) == tomorrow8
+    )
+    check(
+        "pause end: 23:30 is tomorrow 08:00",
+        VaultLogic.pauseEndForChoice(VaultLogic.PauseChoice.UNTIL_TOMORROW, utcMs(2026, 2, 10, 23, 30)) == tomorrow8
+    )
+    check(
+        "pause end: 00:30 is today 08:00",
+        VaultLogic.pauseEndForChoice(VaultLogic.PauseChoice.UNTIL_TOMORROW, utcMs(2026, 2, 10, 0, 30)) == today8
+    )
+
+    val w = VaultLogic.PauseWindow(1000L, 2000L)
+    val w2 = VaultLogic.PauseWindow(5000L, 6000L)
+    check("pause window: before the start is outside", !VaultLogic.isInPauseWindow(999L, listOf(w)))
+    check("pause window: the start itself is inside", VaultLogic.isInPauseWindow(1000L, listOf(w)))
+    check("pause window: the middle is inside", VaultLogic.isInPauseWindow(1500L, listOf(w)))
+    check("pause window: the end itself is outside", !VaultLogic.isInPauseWindow(2000L, listOf(w)))
+    check("pause window: an empty list never matches", !VaultLogic.isInPauseWindow(1500L, emptyList()))
+    check("pause window: a second window matches", VaultLogic.isInPauseWindow(5500L, listOf(w, w2)))
+    check("pause window: between windows is outside", !VaultLogic.isInPauseWindow(3000L, listOf(w, w2)))
+
+    check("paused at: inside the window", VaultLogic.isPausedAt(1500L, listOf(w)))
+    check("paused at: the end itself is over", !VaultLogic.isPausedAt(2000L, listOf(w)))
+    check("paused at: nothing recorded", !VaultLogic.isPausedAt(1500L, emptyList()))
+    check(
+        "active window: an overlap picks the latest end",
+        VaultLogic.activePauseWindow(listOf(w, VaultLogic.PauseWindow(1200L, 3000L)), 1500L)?.endMs == 3000L
+    )
+    check("active window: none live", VaultLogic.activePauseWindow(listOf(w), 2500L) == null)
+
+    check("clamp: resuming mid window ends it now", VaultLogic.clampedPauseEnd(w, 1500L) == 1500L)
+    check("clamp: resuming after the end keeps the end", VaultLogic.clampedPauseEnd(w, 2500L) == 2000L)
+    check("clamp: resuming before the start keeps the start", VaultLogic.clampedPauseEnd(w, 500L) == 1000L)
+
+    check(
+        "stale: a window that ended 91 days ago",
+        VaultLogic.isPauseWindowStale(VaultLogic.PauseWindow(t0, t0 + hour), t0 + 91 * day)
+    )
+    check(
+        "stale: a window that ended 89 days ago is kept",
+        !VaultLogic.isPauseWindowStale(VaultLogic.PauseWindow(t0, t0 + hour), t0 + 89 * day)
+    )
+    check(
+        "stale: a window still running is kept",
+        !VaultLogic.isPauseWindowStale(VaultLogic.PauseWindow(t0, t0 + 100 * day), t0 + day)
+    )
+
+    // The watch folder merge refuses pause dated records too.
+    val inside = rec(date = 1500L)
+    val outside = rec(date = 3000L)
+    val plan = VaultLogic.planWatchMerge(emptyMap(), listOf(inside, outside), emptySet(), listOf(w))
+    check("merge pause: the paused call is refused", plan.inserts.none { it.dateMs == 1500L })
+    check("merge pause: the later call still imports", plan.inserts.any { it.dateMs == 3000L })
+    check("merge pause: a paused call is not renamed either", plan.nameUpdates.isEmpty())
+    val planNoWindows = VaultLogic.planWatchMerge(emptyMap(), listOf(inside), emptySet())
+    check("merge pause: no windows means no refusals", planNoWindows.inserts.size == 1)
+
+    // The open pause (v1.2.9): "until I turn it back on", the
+    // app's off switch. It is stored as a window whose end is
+    // OPEN_PAUSE_END_MS, so while it is live it reads as
+    // [start, forever) to every window check.
+    val open = VaultLogic.PauseWindow(t0, VaultLogic.OPEN_PAUSE_END_MS)
+    check(
+        "pause end: until turned on has no end",
+        VaultLogic.pauseEndForChoice(VaultLogic.PauseChoice.UNTIL_TURNED_ON, t0) ==
+            VaultLogic.OPEN_PAUSE_END_MS
+    )
+    check("open pause: it is open", VaultLogic.isOpenPause(open))
+    check("open pause: a timed window is not open", !VaultLogic.isOpenPause(w))
+    check("open window: before the start is outside", !VaultLogic.isInPauseWindow(t0 - 1, listOf(open)))
+    check("open window: the start itself is inside", VaultLogic.isInPauseWindow(t0, listOf(open)))
+    check(
+        "open window: far future dates are still inside while live",
+        VaultLogic.isInPauseWindow(t0 + 10 * 365 * day, listOf(open))
+    )
+    check("open pause: still paused a year on", VaultLogic.isPausedAt(t0 + 365 * day, listOf(open)))
+    check(
+        "open pause: it is the active window",
+        VaultLogic.activePauseWindow(listOf(open), t0 + day) == open
+    )
+    check(
+        "open pause: it wins an overlap with a timed window",
+        VaultLogic.activePauseWindow(listOf(open, VaultLogic.PauseWindow(t0, t0 + 4 * hour)), t0 + hour) == open
+    )
+    check(
+        "open pause: a timed window alone still resolves while one is recorded",
+        VaultLogic.activePauseWindow(
+            listOf(open, VaultLogic.PauseWindow(t0 - 2 * day, t0 - day)), t0 - 36 * hour
+        )?.endMs == t0 - day
+    )
+
+    // Resuming closes the open window at that moment: it becomes
+    // an ordinary finished window with the usual edges, and what
+    // was inside it stays refused forever.
+    val resumeAt = t0 + 2 * hour
+    val closedOpen = VaultLogic.PauseWindow(open.startMs, VaultLogic.clampedPauseEnd(open, resumeAt))
+    check("open pause: resuming clamps its end to now", closedOpen.endMs == resumeAt)
+    check("open pause: once closed it is no longer open", !VaultLogic.isOpenPause(closedOpen))
+    check(
+        "closed open window: the last moment inside stays inside",
+        VaultLogic.isInPauseWindow(resumeAt - 1, listOf(closedOpen))
+    )
+    check(
+        "closed open window: the resume moment itself is outside",
+        !VaultLogic.isInPauseWindow(resumeAt, listOf(closedOpen))
+    )
+    check(
+        "closed open window: a call inside it stays refused long after",
+        VaultLogic.isInPauseWindow(t0 + hour, listOf(closedOpen)) &&
+            !VaultLogic.isPausedAt(resumeAt + day, listOf(closedOpen))
+    )
+
+    // Housekeeping never prunes an open window, however old.
+    check(
+        "stale: an open window is never stale",
+        !VaultLogic.isPauseWindowStale(open, t0 + 3650 * day)
+    )
+    check(
+        "stale: a closed open window prunes 90 days past its end like any other",
+        VaultLogic.isPauseWindowStale(closedOpen, resumeAt + 91 * day)
+    )
+
+    // The watch merge honours an open window too: anything dated
+    // from its start on is refused, earlier records still import.
+    val beforeOpen = rec(date = t0 - hour)
+    val duringOpen = rec(date = t0 + hour)
+    val openPlan = VaultLogic.planWatchMerge(
+        emptyMap(), listOf(beforeOpen, duringOpen), emptySet(), listOf(open)
+    )
+    check("merge open pause: the call from during it is refused", openPlan.inserts.none { it.dateMs == t0 + hour })
+    check("merge open pause: the earlier call still imports", openPlan.inserts.any { it.dateMs == t0 - hour })
 }
