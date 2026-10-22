@@ -3,13 +3,17 @@ package com.calllogvault
 import android.animation.Animator
 import android.animation.AnimatorListenerAdapter
 import android.animation.ObjectAnimator
+import android.animation.PropertyValuesHolder
 import android.animation.ValueAnimator
 import android.app.Activity
 import android.content.Context
 import android.content.Intent
 import android.content.res.Resources
+import android.graphics.Color
 import android.graphics.Typeface
+import android.graphics.drawable.Drawable
 import android.graphics.drawable.GradientDrawable
+import android.graphics.drawable.LayerDrawable
 import android.net.Uri
 import android.os.Bundle
 import android.os.Handler
@@ -24,6 +28,8 @@ import android.view.ViewConfiguration
 import android.view.ViewGroup
 import android.view.animation.DecelerateInterpolator
 import android.view.animation.LinearInterpolator
+import android.view.animation.OvershootInterpolator
+import android.widget.AbsListView
 import android.widget.BaseAdapter
 import android.widget.Button
 import android.widget.EditText
@@ -77,6 +83,25 @@ class MainActivity : Activity() {
     private lateinit var searchEdit: EditText
     private lateinit var clearBtn: TextView
     private lateinit var watchingBox: LinearLayout
+    // The header indicator's dot and label (v1.2.8): they read
+    // Watching in green while the vault is live, and switch to a
+    // Paused state in amber, naming the resume time, while a pause
+    // window is in force.
+    private lateinit var watchDot: View
+    private lateinit var watchLabel: TextView
+    private lateinit var pageTitle: TextView
+    private lateinit var scrollTopButton: TextView
+    // Fast scroll scrubber (v1.2.7): the glass thumb docked to
+    // the right edge of the list area, shorter and wider since
+    // v1.2.9, plus the section bubble that rides beside it while
+    // it is dragged. scrubbing marks a live drag: the finger then
+    // owns the thumb's position, and the scroll callbacks must
+    // not re-derive it mid drag.
+    private lateinit var scrubPill: LinearLayout
+    private lateinit var scrubBubble: TextView
+    private var scrubbing = false
+    private var scrubStartY = 0f
+    private var scrubStartFraction = 0f
 
     // Drawer views
     private lateinit var scrim: View
@@ -91,6 +116,8 @@ class MainActivity : Activity() {
     private lateinit var statAuto: TextView
     private var autoSubtitle: TextView? = null
     private var scheduleSubtitle: TextView? = null
+    private var pauseSubtitle: TextView? = null
+    private var binSubtitle: TextView? = null
     private var watchToggle: ToggleView? = null
     private var autoRestoreToggle: ToggleView? = null
     private var autoRestoreRowView: LinearLayout? = null
@@ -120,6 +147,36 @@ class MainActivity : Activity() {
     private var pullSpin: ObjectAnimator? = null
     private val pullSettleHandler = Handler(Looper.getMainLooper())
     private var pullSettleStartMs = 0L
+
+    // Independent page scroll and scroll to top (v1.2.5, GitHub
+    // issues #6 and #7). The two browse pages still share one
+    // ListView for the pull gesture and the adapter, but each page
+    // owns a saved scroll state that is captured before a switch
+    // and restored after it. The button state is pure and tested.
+    // v1.2.6: the pill's visibility is re-derived from many real
+    // list events (scroll callback values, state changes, touches,
+    // layout passes, applies, restores, resumes), never one path.
+    private var callLogScrollState = VaultLogic.PageScrollState()
+    private var peopleScrollState = VaultLogic.PageScrollState()
+    private val scrollTopMachine = ScrollToTopMachine()
+    private val scrollTopHandler = Handler(Looper.getMainLooper())
+    private var scrollTopPulse: ObjectAnimator? = null
+    private var scrollTopLastWatchPosition = -1
+    // v1.2.6 pill rendering: the last state actually drawn, so the
+    // spring in, pulse and spring out animations fire only on real
+    // transitions and never restart on every scroll callback. The
+    // generation token retires stale animator completions (a hide
+    // finishing after a re-show must not hide the pill again), and
+    // the posted check is the post layout re-read that corrects any
+    // stale pre layout position the synchronous updates measured.
+    private var scrollTopRenderedState: ScrollToTopMachine.State? = null
+    private var scrollTopAnimGeneration = 0
+    private var scrollTopCheckPosted = false
+    private val scrollTopCheck = Runnable {
+        scrollTopCheckPosted = false
+        updateScrollToTopFromList()
+        refreshScrubber()
+    }
 
     /**
      * Vault snapshot from the last full apply: the pair the no-change
@@ -246,6 +303,7 @@ class MainActivity : Activity() {
         buildUi()
         armSnifferOnce()
         updatePermState()
+        updateWatchIndicator()
         // Load first: the screen populates straight from the vault, then
         // the silent sync tops it up. Display never waits on sync.
         if (PermUtil.hasCallLogRead(this)) loadVaultOnly()
@@ -259,6 +317,11 @@ class MainActivity : Activity() {
             refresh(silent = true)
         }
         updatePermState()
+        updateWatchIndicator()
+        updateBinRow()
+        // Coming back to the screen is one more chance to catch the
+        // pill up with wherever the list really rests (v1.2.6).
+        scheduleScrollTopCheck()
     }
 
     /**
@@ -283,6 +346,15 @@ class MainActivity : Activity() {
         pullSettleHandler.removeCallbacks(pullSettleCheck)
         pullAnim?.cancel()
         pullSpin?.cancel()
+        // Neither may the scroll to top watch, arrived beat or pulse.
+        scrollTopHandler.removeCallbacks(scrollTopWatch)
+        scrollTopHandler.removeCallbacks(scrollTopArrivedFinish)
+        scrollTopHandler.removeCallbacks(scrollTopCheck)
+        if (::listView.isInitialized) listView.removeCallbacks(scrollTopCheck)
+        scrollTopPulse?.cancel()
+        scrollTopPulse = null
+        scrollTopAnimGeneration++
+        if (::scrollTopButton.isInitialized) scrollTopButton.animate().cancel()
         super.onDestroy()
     }
 
@@ -323,36 +395,43 @@ class MainActivity : Activity() {
             setOnClickListener { if (drawerOpen) closeDrawer() else openDrawer() }
         }
         topBar.addView(burger)
-        val title = TextView(this).apply {
-            text = "Call Log Vault"
+        pageTitle = TextView(this).apply {
+            text = VaultLogic.mainPageTitle(peopleMode)
             textSize = 20f
             setTypeface(typeface, Typeface.BOLD)
             setTextColor(color(R.color.text))
             layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
                 .apply { marginStart = dp(4) }
         }
-        topBar.addView(title)
+        topBar.addView(pageTitle)
         watchingBox = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
             visibility = View.GONE
+            // While paused the indicator is the Resume now action
+            // (v1.2.8); while watching, a tap does nothing.
+            isClickable = true
+            isFocusable = true
+            pressFeedback()
+            setOnClickListener { onWatchIndicatorTap() }
         }
-        val dot = View(this).apply {
+        watchDot = View(this).apply {
             background = GradientDrawable().apply {
                 shape = GradientDrawable.OVAL
                 setColor(color(R.color.green))
             }
             layoutParams = LinearLayout.LayoutParams(dp(8), dp(8))
         }
-        watchingBox.addView(dot)
-        watchingBox.addView(TextView(this).apply {
+        watchingBox.addView(watchDot)
+        watchLabel = TextView(this).apply {
             text = "Watching"
             textSize = 12f
             setTextColor(color(R.color.muted))
             layoutParams = LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT
             ).apply { marginStart = dp(6) }
-        })
+        }
+        watchingBox.addView(watchLabel)
         topBar.addView(watchingBox)
         content.addView(topBar)
 
@@ -432,6 +511,10 @@ class MainActivity : Activity() {
             divider = null
             isScrollingCacheEnabled = false
             cacheColorHint = 0
+            // v1.2.7: the stock scrollbar thumb at the right edge is
+            // replaced by the draggable scrubber pill below, so the
+            // edge carries one affordance, not two stacked thumbs.
+            isVerticalScrollBarEnabled = false
             // v1.0.5: the pressed highlight lives here, one drawable
             // for the whole list, drawn behind the (transparent) rows.
             // Rows no longer carry individual ripple backgrounds.
@@ -441,6 +524,45 @@ class MainActivity : Activity() {
                     is Item.Display -> openPerson(item.display.numberNorm)
                     else -> {}
                 }
+            }
+            setOnScrollListener(object : AbsListView.OnScrollListener {
+                override fun onScrollStateChanged(view: AbsListView, scrollState: Int) {
+                    // A finger taking the list over mid return ends
+                    // the return: the button then just reports where
+                    // the list really is. Programmatic return scroll
+                    // reports FLING, never TOUCH_SCROLL, so it is
+                    // never mistaken for the user.
+                    if (scrollState == AbsListView.OnScrollListener.SCROLL_STATE_TOUCH_SCROLL &&
+                        scrollTopMachine.state == ScrollToTopMachine.State.RETURNING
+                    ) {
+                        interruptScrollToTopReturn()
+                    }
+                    // Every state change (a fling starting, a scroll
+                    // settling idle) earns a post layout recheck, so
+                    // the pill is never left stale (v1.2.6).
+                    scheduleScrollTopCheck()
+                }
+
+                override fun onScroll(
+                    view: AbsListView,
+                    firstVisibleItem: Int,
+                    visibleItemCount: Int,
+                    totalItemCount: Int
+                ) {
+                    // v1.2.6: measure from the callback's own report
+                    // (the row this callback is about), not a second
+                    // re-read of the view, and queue the post layout
+                    // recheck behind it.
+                    updateScrollToTopFromList(firstVisibleItem)
+                    refreshScrubber()
+                    scheduleScrollTopCheck()
+                }
+            })
+            addOnLayoutChangeListener { _, _, _, _, _, _, _, _, _ ->
+                // A position read before this layout pass can be a
+                // stale pre layout one; re-read once the rows are
+                // actually placed (v1.2.6, the v1.2.5 pill miss).
+                scheduleScrollTopCheck()
             }
         }
         listArea.addView(listView)
@@ -504,6 +626,116 @@ class MainActivity : Activity() {
             FrameLayout.LayoutParams.WRAP_CONTENT,
             FrameLayout.LayoutParams.WRAP_CONTENT,
             Gravity.TOP or Gravity.CENTER_HORIZONTAL))
+
+        // Scroll to top pill (v1.2.5, GitHub issue #7; rebuilt as a
+        // springy glass pill in v1.2.6 after the flat v1.2.5 pill
+        // was missed on device): a floating pill anchored to the
+        // bottom right of the list area. It is a sibling of the
+        // list, never a child, so it takes no part in scrolling,
+        // row taps or the pull gesture; the pull chip lives at the
+        // top centre, far from it. Its words and visibility come
+        // from ScrollToTopMachine, rendered by
+        // renderScrollToTopButton() with a translucent gradient,
+        // a bright hairline stroke and a real shadow, so it reads
+        // as glass floating over the rows on every theme, AMOLED
+        // included. It is added last in the list area, and the
+        // render brings it to the front again, so no sibling can
+        // ever cover it.
+        scrollTopButton = TextView(this).apply {
+            textSize = 14f
+            setTypeface(typeface, Typeface.BOLD)
+            gravity = Gravity.CENTER
+            setPadding(dp(18), 0, dp(18), 0)
+            minWidth = dp(104)
+            elevation = dp(12).toFloat()
+            visibility = View.GONE
+            isClickable = true
+            isFocusable = true
+            pressFeedback()
+            setOnClickListener { startScrollToTop() }
+        }
+        listArea.addView(scrollTopButton, FrameLayout.LayoutParams(
+            FrameLayout.LayoutParams.WRAP_CONTENT, dp(48),
+            Gravity.BOTTOM or Gravity.END
+        ).apply {
+            marginEnd = dp(18)
+            bottomMargin = dp(20)
+        })
+        renderScrollToTopButton()
+
+        // Fast scroll scrubber (v1.2.7): what Arjun meant by
+        // "scroll helper" all along (his v1.2.6 screenshot arrow
+        // pointed at the right edge scrollbar all along): a glass
+        // thumb docked to the right edge of the list area whose
+        // short drag scrubs the whole history, the scroll
+        // multiplier feel. v1.2.9 reshapes it iOS style: shorter
+        // and wider at rest, springing larger while it is held and
+        // shrinking back on release, in a layered frosted glass
+        // skin (see scrubGlassBackground). It is a sibling of the
+        // list like the scroll to top pill, never a row: touches
+        // that land on it are consumed by its own touch listener
+        // and nothing else in the list ever sees them, and every
+        // other touch behaves exactly as before. Its track runs
+        // down the right edge but stops short of the bottom
+        // corner, so it can never overlap the scroll to top pill.
+        // While it is dragged, a small bubble rides beside it
+        // naming the section being targeted (the date header on
+        // Call Logs, the person on People).
+        scrubBubble = TextView(this).apply {
+            textSize = 13f
+            setTypeface(typeface, Typeface.BOLD)
+            setTextColor(color(R.color.text))
+            gravity = Gravity.CENTER
+            setPadding(dp(12), dp(7), dp(12), dp(7))
+            background = scrubGlassBackground(dp(14))
+            elevation = dp(12).toFloat()
+            visibility = View.GONE
+            isClickable = false
+            isFocusable = false
+        }
+        listArea.addView(scrubBubble, FrameLayout.LayoutParams(
+            FrameLayout.LayoutParams.WRAP_CONTENT,
+            FrameLayout.LayoutParams.WRAP_CONTENT,
+            Gravity.TOP or Gravity.END
+        ).apply {
+            marginEnd = dp(SCRUB_PILL_WIDTH_DP + 12)
+            topMargin = dp(SCRUB_TRACK_TOP_DP)
+        })
+        scrubPill = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER
+            background = scrubGlassBackground(dp(SCRUB_PILL_WIDTH_DP / 2))
+            elevation = dp(SCRUB_REST_ELEVATION_DP).toFloat()
+            alpha = SCRUB_REST_ALPHA
+            visibility = View.GONE
+            isClickable = true
+            isFocusable = true
+            contentDescription = "Fast scroll handle"
+            // The grip: three short bars, always drawn the same on
+            // every theme, so the thumb reads as grabbable. They
+            // are sized for the wider v1.2.9 thumb.
+            for (i in 0 until 3) {
+                addView(View(this@MainActivity).apply {
+                    background = GradientDrawable().apply {
+                        shape = GradientDrawable.RECTANGLE
+                        cornerRadius = dp(1).toFloat()
+                        setColor(glassColor(color(R.color.text), 200))
+                    }
+                }, LinearLayout.LayoutParams(dp(16), dp(2)).apply {
+                    if (i > 0) topMargin = dp(3)
+                })
+            }
+            setOnTouchListener { _, event -> onScrubTouch(event) }
+        }
+        listArea.addView(scrubPill, FrameLayout.LayoutParams(
+            dp(SCRUB_PILL_WIDTH_DP), dp(SCRUB_PILL_HEIGHT_DP),
+            Gravity.TOP or Gravity.END
+        ).apply {
+            marginEnd = dp(4)
+            topMargin = dp(SCRUB_TRACK_TOP_DP)
+        })
+        refreshScrubber()
+
         installPullToRefresh()
 
         content.addView(listArea, LinearLayout.LayoutParams(
@@ -580,6 +812,10 @@ class MainActivity : Activity() {
         listView.visibility = if (has) View.VISIBLE else View.GONE
         watchingBox.visibility = if (has) View.VISIBLE else View.GONE
         if (!has) emptyView.visibility = View.GONE
+        // The permission panel owns the list area while it is up:
+        // the scroll to top button must never sit on top of it.
+        updateScrollToTopFromList()
+        scheduleScrollTopCheck()
     }
 
     // -------------------------------------------------------------- Drawer
@@ -649,6 +885,18 @@ class MainActivity : Activity() {
         body.addView(autoRestoreSwitchRow())
 
         body.addView(eyebrow("APP"))
+        val pauseRow = drawerRow(R.drawable.ic_nav_pause, "Pause vault", "") {
+            closeDrawer()
+            showPauseDialog()
+        }
+        pauseSubtitle = pauseRow.second
+        body.addView(pauseRow.first)
+        val binRow = drawerRow(R.drawable.ic_nav_bin, "Bin", "") {
+            closeDrawer()
+            startActivity(Intent(this, BinActivity::class.java))
+        }
+        binSubtitle = binRow.second
+        body.addView(binRow.first)
         body.addView(drawerRow(R.drawable.ic_nav_sync, "Sync now", null) {
             closeDrawer()
             manualSync()
@@ -673,6 +921,8 @@ class MainActivity : Activity() {
         updateAutoRow()
         updateScheduleRow()
         updateWatchRows()
+        updatePauseRow()
+        updateBinRow()
     }
 
     /**
@@ -1227,9 +1477,671 @@ class MainActivity : Activity() {
     }
 
     private fun setMode(people: Boolean) {
+        val switching = people != peopleMode
+        if (switching) {
+            // Issue #6: capture the outgoing page exactly where it
+            // is, then kill its momentum before any item changes.
+            // A fling left running here is what used to carry the
+            // other page away under the user.
+            savePageScrollState(peopleMode)
+            stopListMomentum()
+            cancelScrollToTopWork()
+        }
         peopleMode = people
+        pageTitle.text = VaultLogic.mainPageTitle(peopleMode)
         chipScroll.visibility = if (people) View.GONE else View.VISIBLE
         rebuildItems()
+        if (switching) {
+            restorePageScrollState(peopleMode)
+        } else {
+            updateScrollToTopFromList()
+            scheduleScrollTopCheck()
+        }
+    }
+
+    /** Capture the shared list's current position for one page. */
+    private fun savePageScrollState(forPeople: Boolean) {
+        if (!::listView.isInitialized) return
+        val firstChild = listView.getChildAt(0)
+        val offset = firstChild?.let { it.top - listView.paddingTop }
+        val state = VaultLogic.pageScrollState(listView.firstVisiblePosition, offset)
+        if (forPeople) peopleScrollState = state else callLogScrollState = state
+    }
+
+    /** Restore one page's saved position after its items land. */
+    private fun restorePageScrollState(forPeople: Boolean) {
+        val saved = if (forPeople) peopleScrollState else callLogScrollState
+        val target = VaultLogic.restoredPageScrollState(saved, items.size)
+        listView.post {
+            // A fast second switch owns the list now; a stale
+            // restore for the earlier page must never land on it.
+            if (peopleMode != forPeople) return@post
+            stopListMomentum()
+            listView.setSelectionFromTop(target.firstVisiblePosition, target.firstChildOffsetPx)
+            updateScrollToTopFromList()
+            // The read above still races the layout the restore
+            // just requested; the posted recheck (and the list's
+            // layout listener behind it) settles the pill on the
+            // restored page's real position (v1.2.6).
+            scheduleScrollTopCheck()
+        }
+    }
+
+    /**
+     * Stop any fling or smooth scroll the shared list is running.
+     * A zero distance smooth scroll is the public AbsListView call
+     * that stops its position and fling scrollers in place, without
+     * moving the selection or the visible rows.
+     */
+    private fun stopListMomentum() {
+        if (!::listView.isInitialized) return
+        listView.smoothScrollBy(0, 0)
+    }
+
+    // ------------------------------------------------------- Scroll to top
+
+    /**
+     * Whether the scroll to top button may exist at all right now:
+     * a real, permitted, non empty list is on screen. The permission
+     * panel and the empty state own the list area while they show.
+     */
+    private fun scrollTopListAvailable(): Boolean {
+        if (!::listView.isInitialized || !::scrollTopButton.isInitialized) return false
+        if (listView.visibility != View.VISIBLE) return false
+        if (::permPanel.isInitialized && permPanel.visibility == View.VISIBLE) return false
+        if (::emptyView.isInitialized && emptyView.visibility == View.VISIBLE) return false
+        return items.isNotEmpty()
+    }
+
+    /**
+     * Queue one post layout re-read of the list position (v1.2.6).
+     * v1.2.5 measured synchronously at moments when the ListView
+     * had not laid out its rows yet (right after a data apply, in
+     * the middle of a page restore), so a stale position 0 read
+     * could latch the pill hidden with nothing left to revive it.
+     * Every list event, layout pass, apply, restore, permission
+     * change and resume now also queues this recheck; it coalesces,
+     * so a fling costs at most one queued read per frame turn.
+     */
+    private fun scheduleScrollTopCheck() {
+        if (!::listView.isInitialized || scrollTopCheckPosted) return
+        scrollTopCheckPosted = true
+        listView.post(scrollTopCheck)
+    }
+
+    /** Fold the list's real position into the pill machine and render. */
+    private fun updateScrollToTopFromList() {
+        updateScrollToTopFromList(null)
+    }
+
+    /**
+     * The position fold itself: the machine decides, this only
+     * measures and draws. [reportedFirstVisible] is the scroll
+     * listener's own callback value when the call comes from there
+     * (v1.2.6: trust the callback, do not re-read the view for the
+     * row the callback just described); other callers pass null and
+     * the view is read directly. The "away" test is the pixel
+     * estimate in VaultLogic, not a bare adapter position.
+     */
+    private fun updateScrollToTopFromList(reportedFirstVisible: Int?) {
+        if (!::scrollTopButton.isInitialized) return
+        if (!scrollTopListAvailable()) {
+            cancelScrollToTopWork()
+            return
+        }
+        val first = reportedFirstVisible ?: listView.firstVisiblePosition
+        val firstChild = listView.getChildAt(0)
+        val away = if (firstChild == null) {
+            first > 0
+        } else {
+            VaultLogic.scrollToTopAwayPx(
+                first, firstChild.top, listView.paddingTop,
+                firstChild.height, dp(SCROLL_TOP_AWAY_DP)
+            )
+        }
+        val atTop = if (reportedFirstVisible == null) {
+            listAtTop()
+        } else if (firstChild == null) {
+            first == 0
+        } else {
+            VaultLogic.isAtTop(first, firstChild.top, listView.paddingTop)
+        }
+        val before = scrollTopMachine.state
+        val after = scrollTopMachine.onPosition(awayFromTop = away, atTop = atTop)
+        if (before != ScrollToTopMachine.State.ARRIVED &&
+            after == ScrollToTopMachine.State.ARRIVED
+        ) {
+            onScrollToTopArrived()
+        }
+        renderScrollToTopButton()
+    }
+
+    /** An opaque theme colour restated at [alpha] (0 to 255). */
+    private fun glassColor(opaque: Int, alpha: Int): Int = Color.argb(
+        alpha.coerceIn(0, 255),
+        Color.red(opaque), Color.green(opaque), Color.blue(opaque)
+    )
+
+    /**
+     * The pill's glass skin for one state (v1.2.6): a two stop
+     * translucent gradient (lighter at the top, like light through
+     * glass), a bright hairline stroke, and the view's elevation
+     * shadow underneath. Framework GradientDrawable only, so it
+     * renders identically from API 26 up; no blur API is needed
+     * because the translucency is in the fill itself.
+     */
+    private fun scrollTopGlassBackground(state: ScrollToTopMachine.State): GradientDrawable {
+        val card = color(R.color.card)
+        val primary = color(R.color.primary)
+        val green = color(R.color.green)
+        val (top, bottom, stroke) = when (state) {
+            ScrollToTopMachine.State.RETURNING -> Triple(
+                glassColor(primary, 242),
+                glassColor(color(R.color.primary_dark), 232),
+                glassColor(color(R.color.on_primary), 130)
+            )
+            ScrollToTopMachine.State.ARRIVED -> Triple(
+                glassColor(UiKit.blendOver(card, green, 0.38f), 238),
+                glassColor(UiKit.blendOver(card, green, 0.22f), 224),
+                glassColor(green, 190)
+            )
+            else -> Triple(
+                glassColor(UiKit.blendOver(card, primary, 0.20f), 232),
+                glassColor(UiKit.blendOver(card, primary, 0.10f), 214),
+                glassColor(primary, 165)
+            )
+        }
+        return GradientDrawable(
+            GradientDrawable.Orientation.TL_BR, intArrayOf(top, bottom)
+        ).apply {
+            cornerRadius = dp(24).toFloat()
+            setStroke(dp(1), stroke)
+        }
+    }
+
+    /**
+     * The scrubber's glass skin (v1.2.9): a layered frosted
+     * glass, replacing the v1.2.7 two stop translucency. Three
+     * framework drawables are stacked: a three stop body, bright
+     * at the top like light catching a pane and settling to a
+     * deeper foot, with a stronger hairline stroke; a sheen that
+     * fades white out down the face, the frost; and a thin inner
+     * edge line inset one dp, which reads as the pane's own
+     * thickness catching light. The view's elevation lays the
+     * soft shadow under all of it. Framework drawables only, API
+     * 26 up, no backdrop blur: blurring what sits behind an
+     * arbitrary view is not something the framework offers, so
+     * the frost here is built from the layers, not faked from a
+     * capture. Colours come from the theme palette, so the pane
+     * reads as glass on AMOLED black and on light themes alike.
+     */
+    private fun scrubGlassBackground(cornerDp: Int): Drawable {
+        val card = color(R.color.card)
+        val primary = color(R.color.primary)
+        val radius = dp(cornerDp).toFloat()
+        val body = GradientDrawable(
+            GradientDrawable.Orientation.TOP_BOTTOM,
+            intArrayOf(
+                glassColor(UiKit.blendOver(card, Color.WHITE, 0.50f), 242),
+                glassColor(UiKit.blendOver(card, primary, 0.18f), 232),
+                glassColor(UiKit.blendOver(card, primary, 0.06f), 216)
+            )
+        ).apply {
+            cornerRadius = radius
+            setStroke(dp(1), glassColor(primary, 205))
+        }
+        val sheen = GradientDrawable(
+            GradientDrawable.Orientation.TOP_BOTTOM,
+            intArrayOf(glassColor(Color.WHITE, 115), glassColor(Color.WHITE, 0))
+        ).apply {
+            cornerRadius = radius
+        }
+        val innerEdge = GradientDrawable().apply {
+            shape = GradientDrawable.RECTANGLE
+            cornerRadius = radius
+            setColor(Color.TRANSPARENT)
+            setStroke(dp(1), glassColor(Color.WHITE, 70))
+        }
+        return LayerDrawable(arrayOf(body, sheen, innerEdge)).apply {
+            val inset = dp(1)
+            setLayerInset(1, inset, inset, inset, inset)
+            setLayerInset(2, inset, inset, inset, inset)
+        }
+    }
+
+    /**
+     * The scrubber exists only when the shared list does and is
+     * long enough to need one: the same availability gate as the
+     * scroll to top pill (no permission panel, no empty view), plus
+     * the length threshold.
+     */
+    private fun scrubberAvailable(): Boolean =
+        scrollTopListAvailable() && items.size > SCRUB_MIN_ITEMS
+
+    /**
+     * Show or hide the scrubber and, while no drag is live, mirror
+     * the list's position onto the thumb. Called from the scroll
+     * callbacks and the same post layout recheck that keeps the
+     * scroll to top pill honest, so it costs one fraction read and
+     * one translation per event, nothing more.
+     */
+    private fun refreshScrubber() {
+        if (!::scrubPill.isInitialized) return
+        if (!scrubberAvailable()) {
+            if (scrubbing) endScrub()
+            if (scrubPill.visibility != View.GONE) {
+                scrubPill.visibility = View.GONE
+                scrubBubble.visibility = View.GONE
+            }
+            return
+        }
+        if (scrubPill.visibility != View.VISIBLE) {
+            scrubPill.visibility = View.VISIBLE
+            if (!scrubbing) scrubPill.alpha = SCRUB_REST_ALPHA
+        }
+        if (scrubbing) return
+        val fraction = VaultLogic.scrollFraction(
+            listView.firstVisiblePosition, listView.childCount, items.size
+        )
+        positionScrubPill(fraction)
+    }
+
+    /**
+     * The thumb's travel in pixels: the list viewport minus the
+     * track's top inset, the reserved bottom corner (the scroll to
+     * top pill's ground, 84dp: its 48dp height, 20dp margin and a
+     * gap) and the thumb's own height.
+     */
+    private fun scrubTrackTravelPx(): Int {
+        val viewport = if (listView.height > 0) listView.height
+            else (scrubPill.parent as? View)?.height ?: 0
+        val travel = viewport - dp(SCRUB_TRACK_TOP_DP) -
+            dp(SCRUB_TRACK_BOTTOM_DP) - dp(SCRUB_PILL_HEIGHT_DP)
+        return travel.coerceAtLeast(0)
+    }
+
+    /** Place the thumb at [fraction] of its track. */
+    private fun positionScrubPill(fraction: Float) {
+        val travel = scrubTrackTravelPx()
+        scrubPill.translationY =
+            fraction.coerceIn(0f, 1f) * travel.toFloat()
+    }
+
+    /** Centre the bubble on the thumb, clamped inside the track. */
+    private fun positionScrubBubble() {
+        val bubbleHeight = if (scrubBubble.height > 0) scrubBubble.height else dp(34)
+        val centre = dp(SCRUB_TRACK_TOP_DP) + scrubPill.translationY +
+            dp(SCRUB_PILL_HEIGHT_DP) / 2f
+        val maxY = (scrubTrackTravelPx() + dp(SCRUB_TRACK_TOP_DP)).toFloat()
+        scrubBubble.translationY =
+            (centre - bubbleHeight / 2f).coerceIn(0f, maxY)
+    }
+
+    /**
+     * The section a scrub landing on [index] belongs to: on Call
+     * Logs the nearest date header at or above the row (the list
+     * already interleaves them), on People, which has no headers,
+     * the person at that row. Nothing is invented: both strings
+     * come straight from the adapter items on screen.
+     */
+    private fun scrubSectionLabel(index: Int): String {
+        if (items.isEmpty()) return ""
+        val at = index.coerceIn(0, items.size - 1)
+        for (i in at downTo 0) {
+            val item = items[i]
+            if (item is Item.Header) return item.text
+        }
+        return (items[at] as? Item.Display)?.display?.title.orEmpty()
+    }
+
+    /**
+     * The scrubber's touch discipline: every event that lands on
+     * the thumb belongs to the scrubber and is consumed, so the
+     * list underneath never scrolls, pulls or taps from it. A drag
+     * maps the finger's travel along the track onto the full item
+     * range, so a short drag crosses the whole history.
+     */
+    private fun onScrubTouch(event: MotionEvent): Boolean {
+        when (event.actionMasked) {
+            MotionEvent.ACTION_DOWN -> {
+                if (!scrubberAvailable()) return false
+                scrubbing = true
+                scrubStartY = event.rawY
+                scrubStartFraction = VaultLogic.scrollFraction(
+                    listView.firstVisiblePosition, listView.childCount, items.size
+                )
+                // The grab (v1.2.9): the thumb springs up to held
+                // size with the app's overshoot curve and its
+                // shadow deepens, iOS style, and it stays enlarged
+                // for the whole drag.
+                scrubPill.elevation = dp(SCRUB_HELD_ELEVATION_DP).toFloat()
+                scrubPill.animate().cancel()
+                scrubPill.animate()
+                    .alpha(1f).scaleX(SCRUB_HELD_SCALE).scaleY(SCRUB_HELD_SCALE)
+                    .setDuration(SCRUB_GRAB_MS)
+                    .setInterpolator(OvershootInterpolator(2.0f))
+                    .start()
+                scrubBubble.visibility = View.VISIBLE
+                scrubToFraction(scrubStartFraction)
+                return true
+            }
+            MotionEvent.ACTION_MOVE -> {
+                if (!scrubbing) return false
+                val travel = scrubTrackTravelPx()
+                if (travel <= 0) return true
+                val fraction = scrubStartFraction +
+                    (event.rawY - scrubStartY) / travel.toFloat()
+                scrubToFraction(fraction.coerceIn(0f, 1f))
+                return true
+            }
+            MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                if (!scrubbing) return false
+                endScrub()
+                return true
+            }
+        }
+        return scrubbing
+    }
+
+    /**
+     * One scrub step: the thumb follows the finger's fraction, the
+     * list jumps to the targeted row, and the bubble names the
+     * section that row belongs to, so the landing is visible
+     * before the finger lifts.
+     */
+    private fun scrubToFraction(fraction: Float) {
+        if (items.isEmpty()) return
+        positionScrubPill(fraction)
+        val target = VaultLogic.scrubIndexForFraction(fraction, items.size)
+        listView.setSelection(target)
+        scrubBubble.text = scrubSectionLabel(target)
+        positionScrubBubble()
+    }
+
+    /**
+     * End a drag: bubble away, and the thumb springs back to its
+     * resting size and strength (v1.2.9): the release runs on a
+     * gentle overshoot, so the scale settles through its target
+     * instead of stopping dead, and the shadow thins back down.
+     */
+    private fun endScrub() {
+        scrubbing = false
+        scrubBubble.visibility = View.GONE
+        scrubPill.elevation = dp(SCRUB_REST_ELEVATION_DP).toFloat()
+        scrubPill.animate().cancel()
+        scrubPill.animate()
+            .alpha(SCRUB_REST_ALPHA).scaleX(1f).scaleY(1f)
+            .setDuration(SCRUB_RELEASE_MS)
+            .setInterpolator(OvershootInterpolator(1.4f))
+            .start()
+        refreshScrubber()
+    }
+
+    /**
+     * The pill in its machine state: words, glass, clickability,
+     * and the spring motion for the transition. Repeated renders in
+     * the same state only refresh the content; animations fire on
+     * transitions, tracked in [scrollTopRenderedState]. When the
+     * state first becomes visible the pill springs in (overshoot
+     * scale, a small rise, a fade); when it hides it springs back
+     * down and only then goes GONE, unless [instant] asks for an
+     * immediate hide (page switch, blocked list, teardown).
+     */
+    private fun renderScrollToTopButton(instant: Boolean = false) {
+        if (!::scrollTopButton.isInitialized) return
+        val state = scrollTopMachine.state
+        val label = scrollToTopLabel(state)
+        val previous = scrollTopRenderedState
+        if (label == null) {
+            stopScrollTopPulse()
+            scrollTopRenderedState = state
+            if (instant || scrollTopButton.visibility != View.VISIBLE) {
+                scrollTopAnimGeneration++
+                scrollTopButton.animate().cancel()
+                scrollTopButton.visibility = View.GONE
+                scrollTopButton.alpha = 1f
+                scrollTopButton.scaleX = 1f
+                scrollTopButton.scaleY = 1f
+                scrollTopButton.translationY = 0f
+            } else {
+                springOutScrollTopPill()
+            }
+            return
+        }
+        scrollTopButton.text = label
+        scrollTopButton.contentDescription = when (state) {
+            ScrollToTopMachine.State.READY -> "Scroll to top"
+            ScrollToTopMachine.State.RETURNING -> "Scrolling to top"
+            ScrollToTopMachine.State.ARRIVED -> "At the top"
+            ScrollToTopMachine.State.HIDDEN -> "Scroll to top"
+        }
+        scrollTopButton.background = scrollTopGlassBackground(state)
+        scrollTopButton.setTextColor(
+            when (state) {
+                ScrollToTopMachine.State.RETURNING -> color(R.color.on_primary)
+                ScrollToTopMachine.State.ARRIVED -> color(R.color.green)
+                else -> color(R.color.text)
+            }
+        )
+        val ready = state == ScrollToTopMachine.State.READY
+        scrollTopButton.isClickable = ready
+        scrollTopButton.isFocusable = ready
+        // The pill floats above the list and every list area
+        // sibling; reassert both on every render.
+        scrollTopButton.bringToFront()
+        scrollTopButton.elevation = dp(12).toFloat()
+        val wasVisible = scrollTopButton.visibility == View.VISIBLE && previous != null &&
+            previous != ScrollToTopMachine.State.HIDDEN
+        scrollTopButton.visibility = View.VISIBLE
+        scrollTopRenderedState = state
+        if (!wasVisible) {
+            springInScrollTopPill()
+        } else if (previous != state && state == ScrollToTopMachine.State.ARRIVED) {
+            popScrollTopPill()
+        }
+        if (state == ScrollToTopMachine.State.RETURNING) startScrollTopPulse()
+            else stopScrollTopPulse()
+    }
+
+    /** Spring in: rise, fade and overshoot to full size. */
+    private fun springInScrollTopPill() {
+        val generation = ++scrollTopAnimGeneration
+        scrollTopButton.animate().cancel()
+        scrollTopButton.alpha = 0f
+        scrollTopButton.scaleX = 0.55f
+        scrollTopButton.scaleY = 0.55f
+        scrollTopButton.translationY = dp(18).toFloat()
+        scrollTopButton.animate()
+            .alpha(1f)
+            .scaleX(1f)
+            .scaleY(1f)
+            .translationY(0f)
+            .setDuration(SCROLL_TOP_SPRING_MS)
+            .setInterpolator(OvershootInterpolator(1.7f))
+            .setListener(object : AnimatorListenerAdapter() {
+                override fun onAnimationEnd(animation: Animator) {
+                    if (generation != scrollTopAnimGeneration) return
+                    scrollTopButton.animate().setListener(null)
+                }
+            })
+            .start()
+    }
+
+    /** Spring out: sink, shrink and fade, then GONE. */
+    private fun springOutScrollTopPill() {
+        val generation = ++scrollTopAnimGeneration
+        scrollTopButton.animate().cancel()
+        scrollTopButton.animate()
+            .alpha(0f)
+            .scaleX(0.6f)
+            .scaleY(0.6f)
+            .translationY(dp(14).toFloat())
+            .setDuration(SCROLL_TOP_SPRING_OUT_MS)
+            .setInterpolator(DecelerateInterpolator())
+            .setListener(object : AnimatorListenerAdapter() {
+                override fun onAnimationEnd(animation: Animator) {
+                    if (generation != scrollTopAnimGeneration) return
+                    scrollTopButton.animate().setListener(null)
+                    if (scrollTopMachine.state == ScrollToTopMachine.State.HIDDEN) {
+                        scrollTopButton.visibility = View.GONE
+                        scrollTopButton.alpha = 1f
+                        scrollTopButton.scaleX = 1f
+                        scrollTopButton.scaleY = 1f
+                        scrollTopButton.translationY = 0f
+                    }
+                }
+            })
+            .start()
+    }
+
+    /** A small celebratory pop when the return lands. */
+    private fun popScrollTopPill() {
+        val generation = ++scrollTopAnimGeneration
+        scrollTopButton.animate().cancel()
+        scrollTopButton.animate()
+            .scaleX(1.14f)
+            .scaleY(1.14f)
+            .setDuration(130)
+            .setInterpolator(DecelerateInterpolator())
+            .setListener(object : AnimatorListenerAdapter() {
+                override fun onAnimationEnd(animation: Animator) {
+                    if (generation != scrollTopAnimGeneration) return
+                    scrollTopButton.animate().setListener(null)
+                    scrollTopButton.animate()
+                        .scaleX(1f)
+                        .scaleY(1f)
+                        .setDuration(240)
+                        .setInterpolator(OvershootInterpolator(2.0f))
+                        .start()
+                }
+            })
+            .start()
+    }
+
+    /** A gentle breathing scale while the return is running. */
+    private fun startScrollTopPulse() {
+        if (scrollTopPulse != null) return
+        scrollTopPulse = ObjectAnimator.ofPropertyValuesHolder(
+            scrollTopButton,
+            PropertyValuesHolder.ofFloat(View.SCALE_X, 1f, 1.06f),
+            PropertyValuesHolder.ofFloat(View.SCALE_Y, 1f, 1.06f)
+        ).apply {
+            duration = 460
+            repeatCount = ObjectAnimator.INFINITE
+            repeatMode = ObjectAnimator.REVERSE
+            interpolator = DecelerateInterpolator()
+            start()
+        }
+    }
+
+    private fun stopScrollTopPulse() {
+        scrollTopPulse?.cancel()
+        scrollTopPulse = null
+        if (::scrollTopButton.isInitialized && scrollTopRenderedState != null &&
+            scrollTopMachine.state != ScrollToTopMachine.State.RETURNING
+        ) {
+            // The pulse owned the scale while it ran; hand it back
+            // unless an entrance or pop animation is using it.
+            if (scrollTopButton.visibility == View.VISIBLE &&
+                scrollTopRenderedState != ScrollToTopMachine.State.HIDDEN
+            ) {
+                scrollTopButton.scaleX = 1f
+                scrollTopButton.scaleY = 1f
+            }
+        }
+    }
+
+    /** Tap: start the smooth return and arm its arrival watch. */
+    private fun startScrollToTop() {
+        updateScrollToTopFromList()
+        if (!scrollTopMachine.startReturn()) {
+            renderScrollToTopButton()
+            return
+        }
+        scrollTopButton.performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY)
+        renderScrollToTopButton()
+        val durationMs = scrollToTopDurationMs(listView.firstVisiblePosition)
+        scrollTopLastWatchPosition = listView.firstVisiblePosition
+        listView.smoothScrollToPositionFromTop(0, 0, durationMs)
+        scrollTopHandler.removeCallbacks(scrollTopWatch)
+        scrollTopHandler.postDelayed(
+            scrollTopWatch, durationMs + SCROLL_TOP_WATCH_GRACE_MS
+        )
+    }
+
+    /**
+     * Arrival fallback: the scroll listener normally spots the top
+     * first. A return that is still making progress toward the top
+     * gets another short watch; one that has stalled anywhere else
+     * (a data change or an interrupted smooth scroll) falls back to
+     * reporting the list's real position instead of spinning on.
+     */
+    private val scrollTopWatch: Runnable = object : Runnable {
+        override fun run() {
+            if (scrollTopMachine.state != ScrollToTopMachine.State.RETURNING) return
+            if (scrollTopListAvailable() && listAtTop()) {
+                scrollTopMachine.onPosition(awayFromTop = false, atTop = true)
+                onScrollToTopArrived()
+                renderScrollToTopButton()
+                return
+            }
+            val position = if (::listView.isInitialized) listView.firstVisiblePosition else -1
+            if (position >= 0 && position < scrollTopLastWatchPosition) {
+                scrollTopLastWatchPosition = position
+                scrollTopHandler.postDelayed(this, SCROLL_TOP_WATCH_GRACE_MS)
+            } else {
+                interruptScrollToTopReturn()
+            }
+        }
+    }
+
+    /** The return landed: stop the motion and start the brief beat. */
+    private fun onScrollToTopArrived() {
+        scrollTopHandler.removeCallbacks(scrollTopWatch)
+        scrollTopHandler.removeCallbacks(scrollTopArrivedFinish)
+        scrollTopHandler.postDelayed(scrollTopArrivedFinish, SCROLL_TOP_ARRIVED_MS)
+    }
+
+    private val scrollTopArrivedFinish = Runnable {
+        if (scrollTopMachine.finishArrived() == ScrollToTopMachine.State.HIDDEN) {
+            renderScrollToTopButton()
+        }
+    }
+
+    /**
+     * End a return without arriving: the user grabbed the list, the
+     * list changed under it, or the fallback watch found it still
+     * travelling after its time. The machine lands on whatever the
+     * list is really doing.
+     */
+    private fun interruptScrollToTopReturn() {
+        scrollTopHandler.removeCallbacks(scrollTopWatch)
+        scrollTopHandler.removeCallbacks(scrollTopArrivedFinish)
+        if (scrollTopListAvailable()) {
+            scrollTopMachine.interrupt(
+                awayFromTop = VaultLogic.isMeaningfullyAwayFromTop(listView.firstVisiblePosition),
+                atTop = listAtTop()
+            )
+        } else {
+            scrollTopMachine.reset()
+        }
+        renderScrollToTopButton()
+    }
+
+    /** Drop every pending scroll to top action and hide the pill at once. */
+    private fun cancelScrollToTopWork() {
+        scrollTopHandler.removeCallbacks(scrollTopWatch)
+        scrollTopHandler.removeCallbacks(scrollTopArrivedFinish)
+        stopScrollTopPulse()
+        scrollTopMachine.reset()
+        renderScrollToTopButton(instant = true)
+        // v1.2.7: the scrubber hides with the pill on a page switch
+        // or a blocked list; the rechecks behind the switch re-show
+        // it mirrored to whichever page and position lands.
+        if (::scrubPill.isInitialized && !scrubbing) {
+            scrubPill.visibility = View.GONE
+            scrubBubble.visibility = View.GONE
+        }
     }
 
     // --------------------------------------------------------------- Chips
@@ -1313,13 +2225,173 @@ class MainActivity : Activity() {
         refresh(silent = false)
     }
 
+    // ------------------------------------------------- Pause (v1.2.8)
+
+    /** The pause in force right now, read from the stored windows. */
+    private fun currentPauseWindow(): VaultLogic.PauseWindow? {
+        return try {
+            val helper = VaultDb.get(this)
+            val now = System.currentTimeMillis()
+            VaultLogic.activePauseWindow(helper.pauseWindows(helper.readableDatabase), now)
+        } catch (e: Exception) {
+            null
+        }
+    }
+
+    /**
+     * The header indicator and the drawer pause row, restated from
+     * the stored windows: green Watching while live, amber Paused
+     * naming the resume time while a timed window is in force, and
+     * a plain Paused for an open one (v1.2.9), which has no resume
+     * time to name.
+     */
+    private fun updateWatchIndicator() {
+        if (!::watchLabel.isInitialized) return
+        val active = currentPauseWindow()
+        val dotBg = watchDot.background as? GradientDrawable
+        if (active != null) {
+            dotBg?.setColor(color(R.color.amber))
+            watchLabel.text = if (VaultLogic.isOpenPause(active)) {
+                "Paused"
+            } else {
+                "Paused until " + VaultLogic.formatTime(active.endMs)
+            }
+        } else {
+            dotBg?.setColor(color(R.color.green))
+            watchLabel.text = "Watching"
+        }
+        updatePauseRow()
+    }
+
+    private fun updatePauseRow() {
+        val sub = pauseSubtitle ?: return
+        val active = currentPauseWindow()
+        sub.text = when {
+            active == null -> "Stop saving new calls for a while"
+            VaultLogic.isOpenPause(active) -> "Paused until you turn it back on"
+            else -> "Paused, resumes " + VaultLogic.formatTime(active.endMs)
+        }
+    }
+
+    private fun updateBinRow() {
+        val sub = binSubtitle ?: return
+        val count = try {
+            val helper = VaultDb.get(this)
+            helper.binCount(helper.readableDatabase)
+        } catch (e: Exception) {
+            0L
+        }
+        sub.text = when {
+            count <= 0L -> "Deleted calls are kept here for 30 days"
+            count == 1L -> "1 deleted call, kept for 30 days"
+            else -> count.toString() + " deleted calls, kept for 30 days"
+        }
+    }
+
+    /** Tapping the header indicator while paused offers the resume. */
+    private fun onWatchIndicatorTap() {
+        val active = currentPauseWindow() ?: return
+        val body = if (VaultLogic.isOpenPause(active)) {
+            "New calls are not being saved. The vault stays paused until " +
+                "you resume. Calls made during the pause are never saved, " +
+                "even after it ends."
+        } else {
+            "New calls are not being saved. The pause ends at " +
+                VaultLogic.formatTime(active.endMs) + ", or right now if you resume. " +
+                "Calls made during the pause are never saved, even after it ends."
+        }
+        VaultDialog.message(
+            this,
+            "Vault is paused",
+            body,
+            positiveLabel = "Resume now",
+            onPositive = { resumePause() },
+            negativeLabel = "Stay paused",
+            onNegative = null
+        )
+    }
+
+    /**
+     * The drawer pause action: pick a length, or resume when
+     * paused. While any pause is in force, timed or open, the
+     * only way offered is Resume now: pauses never stack, so a
+     * new length can only be picked from a live vault.
+     */
+    private fun showPauseDialog() {
+        val active = currentPauseWindow()
+        if (active != null) {
+            onWatchIndicatorTap()
+            return
+        }
+        VaultDialog.singleChoice(
+            this,
+            "Pause the vault",
+            listOf(
+                "For 1 hour", "For 4 hours", "Until tomorrow, 8:00 AM",
+                "Until I turn it back on"
+            ),
+            -1
+        ) { index ->
+            val choice = when (index) {
+                0 -> VaultLogic.PauseChoice.ONE_HOUR
+                1 -> VaultLogic.PauseChoice.FOUR_HOURS
+                2 -> VaultLogic.PauseChoice.UNTIL_TOMORROW
+                else -> VaultLogic.PauseChoice.UNTIL_TURNED_ON
+            }
+            startPause(choice)
+        }
+    }
+
+    private fun startPause(choice: VaultLogic.PauseChoice) {
+        val now = System.currentTimeMillis()
+        val end = VaultLogic.pauseEndForChoice(choice, now)
+        VaultExecutor.service.execute {
+            try {
+                val helper = VaultDb.get(this)
+                helper.startPause(helper.writableDatabase, now, end)
+            } catch (ignored: Exception) {
+            }
+            runOnUiThread {
+                updateWatchIndicator()
+                if (choice == VaultLogic.PauseChoice.UNTIL_TURNED_ON) {
+                    toast("Vault paused until you turn it back on")
+                } else {
+                    toast("Vault paused until " + VaultLogic.formatTime(end))
+                }
+            }
+        }
+    }
+
+    /**
+     * Resume now: the live window's stored end is clamped to this
+     * moment (the window stays on record, so calls inside it stay
+     * refused), then an ordinary silent sync catches the vault up
+     * with everything after the resume.
+     */
+    private fun resumePause() {
+        VaultExecutor.service.execute {
+            try {
+                val helper = VaultDb.get(this)
+                helper.endPauseNow(helper.writableDatabase, System.currentTimeMillis())
+            } catch (ignored: Exception) {
+            }
+            runOnUiThread {
+                updateWatchIndicator()
+                toast("Vault resumed")
+                refresh(silent = true)
+            }
+        }
+    }
+
     // ------------------------------------------------------- Pull to sync
 
     /**
      * Pull to refresh on the main list (v1.2.3, GitHub issue #5).
-     * The one ListView backs both the Call log and the People page
-     * (setMode only flips peopleMode), so a single install covers
-     * both. The gesture can only start at the very top of the list
+     * The one ListView backs both the Call log and the People page,
+     * so a single install covers both. Since v1.2.5 setMode saves
+     * the outgoing page's scroll state and restores the incoming
+     * page's, but the gesture itself is unchanged. It can only
+     * start at the very top of the list
      * and only on a clearly downward finger; [PullRefreshMachine]
      * makes every arming and triggering decision. Events the pull
      * does not claim are never consumed, so row taps, long presses
@@ -1337,6 +2409,17 @@ class MainActivity : Activity() {
         var startX = 0f
         var startY = 0f
         listView.setOnTouchListener { _, e ->
+            // The finger itself is a list event too (v1.2.6): a
+            // move, a release or a cancel queues the post layout
+            // recheck, so the pill tracks the list even on any path
+            // where the scroll callback is coalesced or missed.
+            // The gesture handling below is untouched.
+            if (e.actionMasked == MotionEvent.ACTION_MOVE ||
+                e.actionMasked == MotionEvent.ACTION_UP ||
+                e.actionMasked == MotionEvent.ACTION_CANCEL
+            ) {
+                scheduleScrollTopCheck()
+            }
             when (e.actionMasked) {
                 MotionEvent.ACTION_DOWN -> {
                     tracking = !pullMachine.isRefreshing && listAtTop()
@@ -1433,9 +2516,8 @@ class MainActivity : Activity() {
     /** True only when the list is showing its very first row at its top. */
     private fun listAtTop(): Boolean {
         if (listView.visibility != View.VISIBLE) return false
-        if (listView.firstVisiblePosition != 0) return false
-        val first = listView.getChildAt(0) ?: return true
-        return first.top >= listView.paddingTop
+        val first = listView.getChildAt(0) ?: return listView.firstVisiblePosition == 0
+        return VaultLogic.isAtTop(listView.firstVisiblePosition, first.top, listView.paddingTop)
     }
 
     /**
@@ -1618,6 +2700,34 @@ class MainActivity : Activity() {
             // Stale flag: an earlier sync died without resetting. Recover.
             syncing = false
         }
+        // Pause gate (v1.2.8): while a pause window is in force,
+        // no import path runs from here at all: no system sync, no
+        // watch check. A caller who asked for feedback is told the
+        // vault is paused instead of being shown a pretend sync.
+        // The date filter inside the engines is the backstop for
+        // the background job paths, which never pass through here.
+        val activePause = currentPauseWindow()
+        if (activePause != null) {
+            VaultExecutor.service.execute {
+                try {
+                    val helper = VaultDb.get(this)
+                    helper.housekeeping(helper.writableDatabase, System.currentTimeMillis())
+                } catch (ignored: Exception) {
+                }
+            }
+            updateWatchIndicator()
+            if (!silent || reportResult) {
+                if (VaultLogic.isOpenPause(activePause)) {
+                    toast("Vault is paused until you turn it back on, nothing imported")
+                } else {
+                    toast(
+                        "Vault is paused until " + VaultLogic.formatTime(activePause.endMs) +
+                            ", nothing imported"
+                    )
+                }
+            }
+            return
+        }
         syncing = true
         syncStartedMs = System.currentTimeMillis()
         // Reaching this line means THIS call starts the sync (the
@@ -1730,6 +2840,8 @@ class MainActivity : Activity() {
                 runOnUiThread {
                     syncing = false
                     progress?.dismiss()
+                    updateWatchIndicator()
+                    updateBinRow()
                 }
             }
         }
@@ -1935,11 +3047,20 @@ class MainActivity : Activity() {
 
     /** UI thread only: swap in a prebuilt item list and refresh the empty state. */
     private fun applyItems(newItems: List<Item>) {
+        // A list landing mid return ends the return: its positions
+        // describe a different list than the one the return started
+        // on. (Mode switches reset the machine before they rebuild,
+        // so this only fires for filters, searches and refreshes.)
+        if (scrollTopMachine.state == ScrollToTopMachine.State.RETURNING) {
+            interruptScrollToTopReturn()
+        }
         items = newItems
         adapter.notifyDataSetChanged()
         // Empty states
         if (!PermUtil.hasCallLogRead(this)) {
             emptyView.visibility = View.GONE
+            updateScrollToTopFromList()
+            scheduleScrollTopCheck()
             return
         }
         if (items.isEmpty()) {
@@ -1956,6 +3077,10 @@ class MainActivity : Activity() {
         } else {
             emptyView.visibility = View.GONE
         }
+        updateScrollToTopFromList()
+        // The read above ran before the applied rows were laid
+        // out; queue the post layout correction (v1.2.6).
+        scheduleScrollTopCheck()
     }
 
     private fun openPerson(numberNorm: String) {
@@ -2378,6 +3503,32 @@ class MainActivity : Activity() {
         private const val PULL_MIN_SPIN_MS = 450L
         private const val PULL_SETTLE_CAP_MS = 135_000L
         private const val SEARCH_DEBOUNCE_MS = 120L
+        private const val SCROLL_TOP_ARRIVED_MS = 900L
+        private const val SCROLL_TOP_WATCH_GRACE_MS = 350L
+        // v1.2.6 pill: the pixel estimate past which even a still
+        // first row counts as away, and the spring timings.
+        private const val SCROLL_TOP_AWAY_DP = 96
+        private const val SCROLL_TOP_SPRING_MS = 380L
+        private const val SCROLL_TOP_SPRING_OUT_MS = 220L
+        // v1.2.7 fast scroll scrubber: only lists longer than this
+        // grow the edge thumb; its track keeps the top inset small
+        // and reserves the bottom 84dp (48dp pill + 20dp margin +
+        // gap) so the thumb never reaches the scroll to top pill.
+        // v1.2.9: the thumb is shorter and wider, iOS style (36x44),
+        // and grows while held: scale to SCRUB_HELD_SCALE with a
+        // springy overshoot on the grab, back to 1x on the release,
+        // with the shadow deepening while it is in the hand.
+        private const val SCRUB_MIN_ITEMS = 25
+        private const val SCRUB_PILL_WIDTH_DP = 36
+        private const val SCRUB_PILL_HEIGHT_DP = 44
+        private const val SCRUB_TRACK_TOP_DP = 8
+        private const val SCRUB_TRACK_BOTTOM_DP = 84
+        private const val SCRUB_REST_ALPHA = 0.55f
+        private const val SCRUB_HELD_SCALE = 1.25f
+        private const val SCRUB_GRAB_MS = 220L
+        private const val SCRUB_RELEASE_MS = 240L
+        private const val SCRUB_REST_ELEVATION_DP = 12
+        private const val SCRUB_HELD_ELEVATION_DP = 18
         private const val REQ_PERMISSIONS = 100
         private const val REQ_EXPORT = 2001
         private const val REQ_IMPORT = 2002

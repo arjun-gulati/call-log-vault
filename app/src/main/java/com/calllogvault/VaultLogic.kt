@@ -1,6 +1,7 @@
 package com.calllogvault
 
 import java.security.MessageDigest
+import kotlin.math.roundToInt
 import java.text.SimpleDateFormat
 import java.util.Calendar
 import java.util.Date
@@ -383,12 +384,15 @@ object VaultLogic {
      * A record whose key is tombstoned on this device (see
      * [tombstoneHash]) is skipped entirely: no insert, no rename.
      * A manual delete on this device wins over the other device's
-     * copy arriving again, exactly like it wins over a sync.
+     * copy arriving again, exactly like it wins over a sync. The
+     * same holds for a record dated inside one of [pauseWindows]:
+     * a paused span of history is refused forever, by every path.
      */
     fun planWatchMerge(
         existingNames: Map<String, String>,
         incoming: List<CallRecord>,
-        tombstoneHashes: Set<String> = emptySet()
+        tombstoneHashes: Set<String> = emptySet(),
+        pauseWindows: List<PauseWindow> = emptyList()
     ): MergePlan {
         val working = HashMap(existingNames)
         val inserts = ArrayList<CallRecord>()
@@ -396,6 +400,10 @@ object VaultLogic {
         for (r in incoming) {
             val key = dedupeKey(r)
             if (isTombstoned(key, tombstoneHashes)) continue
+            // A call dated inside a pause window (v1.2.8) never
+            // enters the vault, not even by arriving again later
+            // through the watch folder: no insert, no rename.
+            if (isInPauseWindow(r.dateMs, pauseWindows)) continue
             val current = working[key]
             if (current == null) {
                 inserts.add(r)
@@ -449,6 +457,135 @@ object VaultLogic {
         vaultKeys: Set<String>,
         tombstoneHashes: Set<String>
     ): List<CallRecord> = records.filter { shouldAcceptRecord(dedupeKey(it), vaultKeys, tombstoneHashes) }
+
+    // --------------------------------------------- Bin (v1.2.8)
+
+    /** How long a deleted call stays in the bin before it is purged for good. */
+    const val BIN_RETENTION_MS: Long = 30L * 24 * 60 * 60 * 1000
+
+    private const val DAY_MS: Long = 24L * 60 * 60 * 1000
+
+    /** One binned call: its bin row id, the full saved record, and when it was deleted. */
+    data class BinEntry(val binId: Long, val record: CallRecord, val deletedAtMs: Long)
+
+    /**
+     * True once a bin row has sat for the full retention. The
+     * boundary is inclusive: a row deleted exactly 30 days ago is
+     * expired. A delete time in the future (a clock that jumped
+     * back) is never expired, so nothing is purged early.
+     */
+    fun isBinExpired(deletedAtMs: Long, nowMs: Long): Boolean =
+        nowMs - deletedAtMs >= BIN_RETENTION_MS
+
+    /**
+     * Whole days a bin row still has left, for the Bin screen:
+     * 30 at the moment of the delete, 1 through its last day, 0
+     * once expired. Never negative, never above 30.
+     */
+    fun binDaysLeft(deletedAtMs: Long, nowMs: Long): Int {
+        val remaining = BIN_RETENTION_MS - (nowMs - deletedAtMs)
+        if (remaining <= 0L) return 0
+        val days = (remaining + DAY_MS - 1) / DAY_MS
+        return days.coerceIn(1L, 30L).toInt()
+    }
+
+    // -------------------------------------------- Pause (v1.2.8)
+
+    /**
+     * One recorded pause: imports refuse any call dated inside
+     * [startMs, endMs), forever. The start is inclusive and the
+     * end exclusive, so a call made at the exact resume moment
+     * counts as life after the pause and imports normally. A
+     * pause with no planned end (v1.2.9, "until I turn it back
+     * on") is stored with [OPEN_PAUSE_END_MS] as its end, so
+     * while it is live every window check below reads it as
+     * [startMs, forever); resuming rewrites the stored end to
+     * the resume moment and it becomes an ordinary window.
+     */
+    data class PauseWindow(val startMs: Long, val endMs: Long)
+
+    /** The four pause lengths the drawer offers. */
+    enum class PauseChoice { ONE_HOUR, FOUR_HOURS, UNTIL_TOMORROW, UNTIL_TURNED_ON }
+
+    /**
+     * The stored end of a pause that has no planned end: so far
+     * in the future that every real timestamp falls before it,
+     * which is what makes the open window read as endless to
+     * [isInPauseWindow] and [activePauseWindow] without a second
+     * code path. It is never a real resume time and must never
+     * be shown to the user as one; test for it with [isOpenPause].
+     */
+    const val OPEN_PAUSE_END_MS: Long = Long.MAX_VALUE
+
+    /** True when [window] is a pause with no planned end, still open. */
+    fun isOpenPause(window: PauseWindow): Boolean = window.endMs == OPEN_PAUSE_END_MS
+
+    /** How long finished pause windows are kept as refusal records. */
+    const val PAUSE_WINDOW_KEEP_MS: Long = 90L * 24 * 60 * 60 * 1000
+
+    /**
+     * The resume moment for one pause [choice], counted from
+     * [nowMs]. UNTIL_TOMORROW is the next 08:00 local time strictly
+     * in the future: at 07:59 it is this morning, at 08:00 sharp it
+     * is already tomorrow morning. UNTIL_TURNED_ON has no resume
+     * moment at all: its end is [OPEN_PAUSE_END_MS].
+     */
+    fun pauseEndForChoice(choice: PauseChoice, nowMs: Long): Long = when (choice) {
+        PauseChoice.ONE_HOUR -> nowMs + 60L * 60 * 1000
+        PauseChoice.FOUR_HOURS -> nowMs + 4L * 60 * 60 * 1000
+        PauseChoice.UNTIL_TURNED_ON -> OPEN_PAUSE_END_MS
+        PauseChoice.UNTIL_TOMORROW -> {
+            val cal = Calendar.getInstance()
+            cal.timeInMillis = nowMs
+            cal.set(Calendar.HOUR_OF_DAY, 8)
+            cal.set(Calendar.MINUTE, 0)
+            cal.set(Calendar.SECOND, 0)
+            cal.set(Calendar.MILLISECOND, 0)
+            if (cal.timeInMillis <= nowMs) cal.add(Calendar.DAY_OF_YEAR, 1)
+            cal.timeInMillis
+        }
+    }
+
+    /** True when [callDateMs] falls inside any recorded pause window. */
+    fun isInPauseWindow(callDateMs: Long, windows: List<PauseWindow>): Boolean =
+        windows.any { callDateMs >= it.startMs && callDateMs < it.endMs }
+
+    /**
+     * The pause in force at [nowMs], or null when the vault is
+     * live. Overlapping windows resolve to the one that ends
+     * latest, which is the honest resume time; an open window's
+     * endless end always wins that resolution, so it stays the
+     * pause in force until it is resumed.
+     */
+    fun activePauseWindow(windows: List<PauseWindow>, nowMs: Long): PauseWindow? =
+        windows.filter { nowMs >= it.startMs && nowMs < it.endMs }
+            .maxByOrNull { it.endMs }
+
+    /** True when the vault is paused at [nowMs]. */
+    fun isPausedAt(nowMs: Long, windows: List<PauseWindow>): Boolean =
+        activePauseWindow(windows, nowMs) != null
+
+    /**
+     * Where a resume-now at [nowMs] leaves the window's end: the
+     * earlier of the planned end and now, and never before the
+     * window's own start, so a clamped window is never inverted.
+     * For an open window the planned end is endless, so the
+     * resume always lands exactly on now and closes it.
+     */
+    fun clampedPauseEnd(window: PauseWindow, nowMs: Long): Long =
+        minOf(window.endMs, maxOf(window.startMs, nowMs))
+
+    /**
+     * True when a finished window is old enough to prune: it ended
+     * more than [PAUSE_WINDOW_KEEP_MS] ago. A window still running
+     * or recently ended is never stale, and an open window is
+     * never stale at all: housekeeping must not prune the pause
+     * the user has not ended yet.
+     */
+    fun isPauseWindowStale(window: PauseWindow, nowMs: Long): Boolean {
+        if (isOpenPause(window)) return false
+        return nowMs - window.endMs > PAUSE_WINDOW_KEEP_MS
+    }
 
     /**
      * An exact delete against the phone's own call log for one
@@ -517,6 +654,117 @@ object VaultLogic {
         if (!hasRecords) return true
         if (added != 0) return true
         return newCount != snapshotCount
+    }
+
+    /** Main top bar title for the two browse pages (GitHub issue #8). */
+    fun mainPageTitle(peopleMode: Boolean): String = if (peopleMode) "People" else "Call Logs"
+
+    /**
+     * One page's saved list position: the first visible adapter row
+     * and that row's offset from the list's top padding. The offset
+     * is negative while the row is partly scrolled above the top.
+     */
+    data class PageScrollState(
+        val firstVisiblePosition: Int = 0,
+        val firstChildOffsetPx: Int = 0
+    )
+
+    /** Sanitized scroll state captured from a list. */
+    fun pageScrollState(firstVisiblePosition: Int, firstChildOffsetPx: Int?): PageScrollState =
+        PageScrollState(
+            firstVisiblePosition = firstVisiblePosition.coerceAtLeast(0),
+            firstChildOffsetPx = firstChildOffsetPx ?: 0
+        )
+
+    /** A saved scroll state made safe for a list of [itemCount] rows. */
+    fun restoredPageScrollState(state: PageScrollState, itemCount: Int): PageScrollState {
+        if (itemCount <= 0) return PageScrollState()
+        return state.copy(
+            firstVisiblePosition = state.firstVisiblePosition.coerceIn(0, itemCount - 1)
+        )
+    }
+
+    /** True when the first row is at, or back above, the list's top padding. */
+    fun isAtTop(firstVisiblePosition: Int, firstChildTopPx: Int, paddingTopPx: Int): Boolean =
+        firstVisiblePosition == 0 && firstChildTopPx >= paddingTopPx
+
+    /**
+     * True once at least one whole row has scrolled above the list.
+     * A partly scrolled first row alone does not bring up the
+     * scroll to top button, so it never flickers on for tiny scrolls.
+     */
+    fun isMeaningfullyAwayFromTop(firstVisiblePosition: Int): Boolean =
+        firstVisiblePosition > 0
+
+    /**
+     * Estimated distance the list has scrolled, in pixels (v1.2.6).
+     * Whole rows above the first visible one are approximated with
+     * the first visible row's own height (rows and date headers are
+     * close enough in height for a visibility threshold), plus the
+     * part of that first row already above the top padding.
+     */
+    fun estimatedScrollPx(
+        firstVisiblePosition: Int,
+        firstChildTopPx: Int,
+        paddingTopPx: Int,
+        firstChildHeightPx: Int
+    ): Int {
+        if (firstVisiblePosition < 0) return 0
+        val within = (paddingTopPx - firstChildTopPx).coerceAtLeast(0)
+        val rowHeight = if (firstChildHeightPx > 0) firstChildHeightPx else 0
+        return firstVisiblePosition * rowHeight + within
+    }
+
+    /**
+     * The scroll to top pill's "away" test (v1.2.6): any whole row
+     * above the list is away, and so is an estimated scroll past
+     * [thresholdPx] while the first row is still the partly scrolled
+     * one (a tall first row, or a position read mid layout). This
+     * replaces the v1.2.5 position only test, which a single stale
+     * pre layout read of position 0 could latch off.
+     */
+    fun scrollToTopAwayPx(
+        firstVisiblePosition: Int,
+        firstChildTopPx: Int,
+        paddingTopPx: Int,
+        firstChildHeightPx: Int,
+        thresholdPx: Int
+    ): Boolean {
+        if (firstVisiblePosition < 0) return false
+        if (firstVisiblePosition > 0) return true
+        return estimatedScrollPx(
+            firstVisiblePosition, firstChildTopPx, paddingTopPx, firstChildHeightPx
+        ) >= thresholdPx.coerceAtLeast(0)
+    }
+
+    /**
+     * The list's scrolled fraction, for the fast scroll scrubber's
+     * thumb (v1.2.7): 0 at the very top, 1 when the last page of
+     * rows is on screen. [firstVisible] and [visibleCount] are the
+     * rows currently laid out of [totalCount]. When everything fits
+     * on one screen there is no travel, so the fraction is 0, and
+     * out of range reports clamp instead of escaping 0..1.
+     */
+    fun scrollFraction(firstVisible: Int, visibleCount: Int, totalCount: Int): Float {
+        if (totalCount <= 0 || visibleCount <= 0) return 0f
+        val travel = totalCount - visibleCount
+        if (travel <= 0) return 0f
+        val travelled = firstVisible.coerceAtLeast(0).toFloat() / travel.toFloat()
+        return travelled.coerceIn(0f, 1f)
+    }
+
+    /**
+     * The adapter index the scrubber thumb targets at [fraction]
+     * of its track (v1.2.7): fraction 0 is the first row and
+     * fraction 1 the last, so a short thumb drag crosses the whole
+     * list (the scroll multiplier feel Arjun asked for). Fractions
+     * outside 0..1 clamp, and an empty list targets 0 rather than
+     * a row that does not exist.
+     */
+    fun scrubIndexForFraction(fraction: Float, itemCount: Int): Int {
+        if (itemCount <= 0) return 0
+        val clamped = fraction.coerceIn(0f, 1f)
+        return (clamped * (itemCount - 1)).roundToInt().coerceIn(0, itemCount - 1)
     }
 
     /** Display name for a document tree id like "primary:Download/Backups". */
@@ -1260,6 +1508,90 @@ class PullRefreshMachine(private val armThresholdPx: Float) {
         return true
     }
 }
+
+/**
+ * Scroll to top button state machine (v1.2.5, GitHub issue #7).
+ * Pure: the view layer reports whether the list is meaningfully
+ * away from the top and whether it is exactly at the top, and this
+ * machine owns every visibility and progress decision. Since
+ * v1.2.6 the away report is the pixel estimate above, re-derived
+ * from many list events, after the v1.2.5 pill was missed on
+ * device. A return can
+ * only start from READY, so a second tap can never restart it, and
+ * arrival is a separate brief state instead of the button simply
+ * vanishing the moment the list lands.
+ */
+class ScrollToTopMachine {
+
+    enum class State { HIDDEN, READY, RETURNING, ARRIVED }
+
+    var state: State = State.HIDDEN
+        private set
+
+    /** Fold one list position report into the current state. */
+    fun onPosition(awayFromTop: Boolean, atTop: Boolean): State {
+        state = when (state) {
+            State.RETURNING -> if (atTop) State.ARRIVED else State.RETURNING
+            State.ARRIVED -> when {
+                awayFromTop -> State.READY
+                atTop -> State.ARRIVED
+                else -> State.HIDDEN
+            }
+            State.HIDDEN, State.READY -> if (awayFromTop) State.READY else State.HIDDEN
+        }
+        return state
+    }
+
+    /** Start the return. Only a visible, ready button can start one. */
+    fun startReturn(): Boolean {
+        if (state != State.READY) return false
+        state = State.RETURNING
+        return true
+    }
+
+    /**
+     * The user, a mode switch or a data change interrupted the
+     * return. The button then simply reflects where the list is.
+     */
+    fun interrupt(awayFromTop: Boolean, atTop: Boolean): State {
+        if (state == State.RETURNING || state == State.ARRIVED) {
+            state = when {
+                awayFromTop -> State.READY
+                atTop -> State.HIDDEN
+                else -> State.HIDDEN
+            }
+        }
+        return state
+    }
+
+    /** The brief arrived state has been shown; put the button away. */
+    fun finishArrived(): State {
+        if (state == State.ARRIVED) state = State.HIDDEN
+        return state
+    }
+
+    /** Forget the button entirely (page switch, empty or blocked list). */
+    fun reset(): State {
+        state = State.HIDDEN
+        return state
+    }
+}
+
+/** The scroll to top button's words for each machine state. */
+fun scrollToTopLabel(state: ScrollToTopMachine.State): String? = when (state) {
+    ScrollToTopMachine.State.HIDDEN -> null
+    ScrollToTopMachine.State.READY -> "↑ Top"
+    ScrollToTopMachine.State.RETURNING -> "↑ Going up"
+    ScrollToTopMachine.State.ARRIVED -> "✓ At top"
+}
+
+/**
+ * How long a return to the top may take: longer lists get more
+ * time, inside a floor and a cap so the progress state is always
+ * visible but never drags.
+ */
+fun scrollToTopDurationMs(firstVisiblePosition: Int): Int =
+    (450 + firstVisiblePosition.coerceAtLeast(0) * 12).coerceIn(450, 1500)
 
 /**
  * The words shown under the pull chip for each machine state
