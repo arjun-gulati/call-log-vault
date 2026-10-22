@@ -29,6 +29,10 @@
             android:exported="false"
             android:configChanges="orientation|screenSize|keyboardHidden" />
 
+        <activity android:name="com.calllogvault.BinActivity"
+            android:exported="false"
+            android:configChanges="orientation|screenSize|keyboardHidden" />
+
         <!-- Sniffer: woken by JobScheduler content triggers on the call log. -->
         <service android:name="com.calllogvault.VaultJobService"
             android:exported="false"
