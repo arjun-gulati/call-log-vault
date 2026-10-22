@@ -25,7 +25,11 @@ import android.widget.Toast
  * sits under the pills. Every delete runs through the two flavor
  * confirmation: vault only, or vault and phone log. Both flavors
  * tombstone the deleted keys, so nothing deleted here ever comes
- * back through a sync, an old backup or the watch folder.
+ * back by itself through a sync, an old backup or the watch
+ * folder. Since v1.2.8 the removed rows also land in the Bin for
+ * 30 days, where the user can restore them (which removes the
+ * tombstone) or delete them forever; the phone log flavor still
+ * deletes the phone's own copy immediately.
  */
 class PersonActivity : Activity() {
 
@@ -432,9 +436,10 @@ class PersonActivity : Activity() {
 
     /**
      * The selection delete confirmation. One dialog, two flavors:
-     * vault only, or vault and phone log. Both tombstone the keys,
-     * so the confirm can honestly promise the entries never come
-     * back to this phone.
+     * vault only, or vault and phone log. Both tombstone the keys
+     * and move the rows to the Bin, so the confirm can honestly
+     * promise the entries never come back by themselves, while
+     * the user can still undo the delete from the Bin for 30 days.
      */
     private fun confirmDeleteSelected() {
         val targets = selectedPositions.sorted().mapNotNull { records.getOrNull(it) }
@@ -444,14 +449,16 @@ class PersonActivity : Activity() {
         val message: String
         if (count == 1) {
             title = "Delete this entry from the vault?"
-            message = "This removes this one call from the vault. " +
-                "It will not come back on this phone, even if it is still in " +
-                "your call log or an old backup."
+            message = "This moves this one call to the Bin. It stays in the Bin " +
+                "for 30 days, and you can restore it from there. It will not " +
+                "come back by itself, even if it is still in your call log " +
+                "or an old backup."
         } else {
             title = "Delete " + count + " entries from the vault?"
-            message = "This removes " + count + " entries from the vault. " +
-                "They will not come back on this phone, even if they are still in " +
-                "your call log or an old backup."
+            message = "This moves " + count + " entries to the Bin. They stay in " +
+                "the Bin for 30 days, and you can restore them from there. " +
+                "They will not come back by themselves, even if they are " +
+                "still in your call log or an old backup."
         }
         VaultDialog.deleteConfirm(this, title, message,
             onVaultOnly = { performDelete(targets, alsoPhone = false) },
@@ -465,21 +472,24 @@ class PersonActivity : Activity() {
         VaultDialog.deleteConfirm(
             this,
             "Delete all entries for this number?",
-            "This removes every entry for this number from the vault, " +
-                targets.size + " in total. They will not come back on this phone, " +
-                "even if they are still in your call log or an old backup.",
+            "This moves every entry for this number to the Bin, " +
+                targets.size + " in total. They stay in the Bin for 30 days, " +
+                "and you can restore them from there. They will not come back " +
+                "by themselves, even if they are still in your call log or " +
+                "an old backup.",
             onVaultOnly = { performDelete(targets, alsoPhone = false) },
             onVaultAndPhone = { performDelete(targets, alsoPhone = true) }
         )
     }
 
     /**
-     * Run one confirmed delete on the vault worker: tombstones and
-     * vault rows in one transaction, then (for the permanent
-     * flavor) the phone log rows. The result dialog states the
-     * plain counts, and its OK either rebuilds this screen or, when
-     * that was the person's last entry, leaves cleanly instead of
-     * showing an empty screen.
+     * Run one confirmed delete on the vault worker: tombstones,
+     * vault rows and their Bin copies in one transaction, then
+     * (for the vault and phone log flavor) the phone log rows.
+     * The result dialog states the plain counts, and its OK
+     * either rebuilds this screen or, when that was the person's
+     * last entry, leaves cleanly instead of showing an empty
+     * screen.
      */
     private fun performDelete(targets: List<VaultLogic.CallRecord>, alsoPhone: Boolean) {
         VaultExecutor.service.execute {

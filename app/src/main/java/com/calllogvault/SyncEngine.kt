@@ -110,6 +110,18 @@ object SyncEngine {
         var skipped = 0
         var seen = 0
         try {
+            // Cheap upkeep rides this existing wakeup (v1.2.8):
+            // expired bin rows purged, old pause windows pruned.
+            helper.housekeeping(db, System.currentTimeMillis())
+            // Pause windows (v1.2.8): while a pause is in force
+            // this scan imports nothing at all. The per record
+            // date filter below is the permanent backstop: after
+            // the pause ends, its stored window still refuses the
+            // calls that happened inside it.
+            val pauseWindows = helper.pauseWindows(db)
+            if (VaultLogic.isPausedAt(System.currentTimeMillis(), pauseWindows)) {
+                return SyncResult(0, 0, 0)
+            }
             val since: Long? = if (windowed) {
                 val max = helper.maxDate(db)
                 if (max > 0) max - WINDOW_MS else null
@@ -172,6 +184,7 @@ object SyncEngine {
                         seen++
                         if (!seenKeys.add(key)) { skipped++; continue }
                         if (VaultLogic.isTombstoned(key, tombstones)) { skipped++; continue }
+                        if (VaultLogic.isInPauseWindow(date, pauseWindows)) { skipped++; continue }
                         var name = if (iName >= 0) c.getString(iName) ?: "" else ""
                         if (VaultLogic.isUnknownName(name)) {
                             val looked = nameCache[norm] ?: lookupContactName(context, number)

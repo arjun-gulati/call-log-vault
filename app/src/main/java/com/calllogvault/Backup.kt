@@ -123,11 +123,29 @@ object Backup {
 
         val helper = VaultDb.get(context)
         val db = helper.writableDatabase
+        // While a pause is in force (v1.2.8) this import does not
+        // run at all; the date filter below is what refuses
+        // pause-dated records after the pause has ended.
+        val activePause = VaultLogic.activePauseWindow(
+            helper.pauseWindows(db), System.currentTimeMillis()
+        )
+        if (activePause != null) {
+            val message = if (VaultLogic.isOpenPause(activePause)) {
+                "The vault is paused until you turn it back on, nothing was imported"
+            } else {
+                "The vault is paused until " + VaultLogic.formatTime(activePause.endMs) +
+                    ", nothing was imported"
+            }
+            return ImportResult(0, 0, records.size, message)
+        }
         val existing = helper.allKeys(db)
         // Tombstones (v1.2.0): a record the user deleted from the
         // vault on purpose stays out, even when an old backup file
         // still carries it.
         val tombstones = helper.tombstoneHashes(db)
+        // Pause windows (v1.2.8): a call dated inside a recorded
+        // pause stays out too, even when an old backup carries it.
+        val pauseWindows = helper.pauseWindows(db)
         var added = 0
         var skipped = 0
         db.beginTransaction()
@@ -136,6 +154,7 @@ object Backup {
                 val key = VaultLogic.dedupeKey(r)
                 if (!existing.add(key)) { skipped++; continue }
                 if (VaultLogic.isTombstoned(key, tombstones)) { skipped++; continue }
+                if (VaultLogic.isInPauseWindow(r.dateMs, pauseWindows)) { skipped++; continue }
                 if (helper.insertIgnore(db, r)) added++ else skipped++
             }
             db.setTransactionSuccessful()
@@ -464,7 +483,9 @@ object AutoBackup {
  * device's history. The one exception is this device's own manual
  * deletes: their tombstones (v1.2.0) are checked during the merge,
  * so a call the user deleted HERE is not resurrected by the other
- * device's copy either. When the same call exists on both devices with
+ * device's copy either. Calls dated inside one of this device's
+ * pause windows (v1.2.8) are refused during the merge the same
+ * way. When the same call exists on both devices with
  * different saved names, the later import's name wins
  * (VaultLogic.planWatchMerge). Auto restore to the phone call log
  * is a separate switch, default off.
@@ -765,6 +786,19 @@ object WatchFolder {
                 recordStatus(context, VaultLogic.WATCH_RESULT_UP_TO_DATE, 0)
                 return WatchResult(0, 0, VaultLogic.WATCH_RESULT_UP_TO_DATE)
             }
+            // While a pause is in force (v1.2.8) the watch import
+            // does not run. The new fingerprint is deliberately NOT
+            // stored, so the next check after the pause can still
+            // import this file, with the merge's date filter then
+            // refusing anything dated inside the pause.
+            val watchHelper = VaultDb.get(context)
+            if (VaultLogic.isPausedAt(
+                    System.currentTimeMillis(),
+                    watchHelper.pauseWindows(watchHelper.readableDatabase)
+                )
+            ) {
+                return skipped
+            }
             if (read.sizeBefore >= 0 && read.sizeAfter >= 0 && read.sizeBefore != read.sizeAfter) {
                 return skipped
             }
@@ -778,7 +812,8 @@ object WatchFolder {
                     val helper = VaultDb.get(context)
                     val db = helper.writableDatabase
                     val plan = VaultLogic.planWatchMerge(
-                        helper.namesByKey(db), parsed.records, helper.tombstoneHashes(db)
+                        helper.namesByKey(db), parsed.records, helper.tombstoneHashes(db),
+                        helper.pauseWindows(db)
                     )
                     val addedRecords = ArrayList<VaultLogic.CallRecord>()
                     var namesUpdated = 0
