@@ -93,7 +93,15 @@ class PersonActivity : Activity() {
             return
         }
         val helper = VaultDb.get(this)
-        records = helper.forNumber(helper.readableDatabase, numberNorm)
+        // Detail for one person (v1.3.0, issue #13): a person is
+        // the merged number group, so the detail loads every call
+        // whose number names the same person as the tapped norm,
+        // not just the exact norm. Vault rows themselves are
+        // untouched; this only widens the read.
+        records = helper.all(helper.readableDatabase)
+            .filter { VaultLogic.numbersSamePerson(it.numberNorm, numberNorm) }
+            .sortedByDescending { it.dateMs }
+            .ifEmpty { helper.forNumber(helper.readableDatabase, numberNorm) }
         if (records.isEmpty()) {
             Toast.makeText(this, "No calls saved for this number", Toast.LENGTH_SHORT).show()
             finish()
@@ -201,16 +209,18 @@ class PersonActivity : Activity() {
             orientation = LinearLayout.HORIZONTAL
             setPadding(0, dp(18), 0, 0)
         }
-        stats1.addView(statCell("Calls", records.size.toString()))
+        stats1.addView(statCell(VaultLogic.callCountLabel(records.size), records.size.toString()))
         stats1.addView(statCell("Talk time", VaultLogic.formatDuration(totalDur)))
-        card.addView(stats1)
+        // Privacy toggle (v1.4.0): the whole stats block goes away
+        // with one switch. The calls themselves are untouched.
+        if (UiKit.showCallDetails(this)) card.addView(stats1)
         val stats2 = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             setPadding(0, dp(12), 0, 0)
         }
         stats2.addView(statCell("First call", VaultLogic.formatDateTime(records.last().dateMs).substringBefore(",")))
         stats2.addView(statCell("Last call", VaultLogic.formatDateTime(records.first().dateMs).substringBefore(",")))
-        card.addView(stats2)
+        if (UiKit.showCallDetails(this)) card.addView(stats2)
         root.addView(card)
 
         // Actions: primary pill Call, secondary pill Restore

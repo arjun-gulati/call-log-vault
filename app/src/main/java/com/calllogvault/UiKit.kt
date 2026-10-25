@@ -54,6 +54,9 @@ object UiKit {
     private const val KEY_APPEARANCE_V2 = "appearance_v2"
     private const val KEY_APPEARANCE_LEGACY = "appearance"
     private const val KEY_AMOLED_FOR_DARK = "amoled_for_dark"
+    private const val KEY_SHOW_CALL_DETAILS = "show_call_details"
+    private const val KEY_SHOW_PEOPLE_MENU = "show_people_menu"
+    private const val KEY_WHATS_NEW_SHOWN = "whats_new_shown_version"
 
     /** Read only by the one time migration; never written anymore. */
     private const val KEY_DARK_FLAVOUR = "appearance_dark_flavour"
@@ -146,6 +149,46 @@ object UiKit {
             .putBoolean(KEY_AMOLED_FOR_DARK, value)
             .apply()
         cachedAmoledForDark = value
+    }
+
+    /**
+     * Privacy toggle (v1.4.0): per person stats on the detail
+     * screen and in People rows. Default on, so nothing changes
+     * for existing users unless they opt out.
+     */
+    fun showCallDetails(context: Context): Boolean =
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            .getBoolean(KEY_SHOW_CALL_DETAILS, true)
+
+    fun setShowCallDetails(context: Context, value: Boolean) {
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
+            .putBoolean(KEY_SHOW_CALL_DETAILS, value)
+            .apply()
+    }
+
+    /**
+     * Privacy toggle (v1.4.0): the whole People menu. Default on.
+     * The People data stays in the vault; only the menu is hidden.
+     */
+    fun showPeopleMenu(context: Context): Boolean =
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            .getBoolean(KEY_SHOW_PEOPLE_MENU, true)
+
+    fun setShowPeopleMenu(context: Context, value: Boolean) {
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
+            .putBoolean(KEY_SHOW_PEOPLE_MENU, value)
+            .apply()
+    }
+
+    /** Last version whose What's New popup was shown, 0 when never shown. */
+    fun whatsNewShownVersion(context: Context): Int =
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            .getInt(KEY_WHATS_NEW_SHOWN, 0)
+
+    fun setWhatsNewShownVersion(context: Context, value: Int) {
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
+            .putInt(KEY_WHATS_NEW_SHOWN, value)
+            .apply()
     }
 
     /** True when [res] carries the night uiMode flag. */

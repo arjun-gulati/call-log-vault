@@ -114,18 +114,78 @@ object VaultLogic {
     fun filterCalls(records: List<CallRecord>, filter: Filter, query: String): List<CallRecord> =
         records.filter { matchesFilter(it, filter) && matchesQuery(it, query) }
 
-    /** Group by normalized number. Sorted by most recent call first. */
+    /**
+     * The detail header count word (v1.3.0, issue #12): a single call
+     * reads "Call", everything else reads "Calls". Callers uppercase
+     * it for the header, so this stays in title case.
+     */
+    fun callCountLabel(count: Int): String = if (count == 1) "Call" else "Calls"
+
+    /**
+     * Whether two normalized numbers name the same person (v1.3.0,
+     * issue #13, grouping only): one's digit string is a suffix of
+     * the other's, so +122233 and 22233 match, in either order.
+     * Empty digit strings never match, so digitless numbers are
+     * never merged by accident. Deliberate trade-off, stated in the
+     * v1.3.0 notes: a short number that happens to be a suffix of a
+     * longer unrelated number merges too. Nothing here touches
+     * storage, dedupe, sync or import; it only decides grouping.
+     */
+    fun numbersSamePerson(normA: String, normB: String): Boolean {
+        val a = digitsOnly(normA)
+        val b = digitsOnly(normB)
+        if (a.isEmpty() || b.isEmpty()) return false
+        return a.endsWith(b) || b.endsWith(a)
+    }
+
+    /**
+     * Group by person. Numbers that name the same person (see
+     * numbersSamePerson) land in one group, so a contact reached
+     * with and without its country code shows once, in either call
+     * order. The merged group's representative number is the
+     * longest digit form (the plus form wins a tie), its display
+     * name follows the existing rule (the name on the most recent
+     * named call, else the latest raw number), and no call record
+     * is merged or lost: every record stays in the group.
+     * Sorted by most recent call first.
+     */
     fun groupPeople(records: List<CallRecord>): List<PersonSummary> {
         val byNumber = LinkedHashMap<String, MutableList<CallRecord>>()
         for (r in records) byNumber.getOrPut(r.numberNorm) { ArrayList() }.add(r)
-        val out = ArrayList<PersonSummary>()
+        val merged = ArrayList<MutableList<CallRecord>>()
+        val mergedRep = ArrayList<String>()
         for ((norm, list) in byNumber) {
+            var target = -1
+            for (i in merged.indices) {
+                if (numbersSamePerson(mergedRep[i], norm)) {
+                    target = i
+                    break
+                }
+            }
+            if (target < 0) {
+                merged.add(ArrayList(list))
+                mergedRep.add(norm)
+            } else {
+                merged[target].addAll(list)
+                val curDigits = digitsOnly(mergedRep[target])
+                val newDigits = digitsOnly(norm)
+                if (newDigits.length > curDigits.length ||
+                    (newDigits.length == curDigits.length &&
+                        norm.startsWith("+") && !mergedRep[target].startsWith("+"))
+                ) {
+                    mergedRep[target] = norm
+                }
+            }
+        }
+        val out = ArrayList<PersonSummary>()
+        for (i in merged.indices) {
+            val list = merged[i]
             val latest = list.maxByOrNull { it.dateMs } ?: continue
             // Display name: the name on the most recent named call, if any.
             val named = list.filter { !isUnknownName(it.name) }.maxByOrNull { it.dateMs }
             out.add(
                 PersonSummary(
-                    numberNorm = norm,
+                    numberNorm = mergedRep[i],
                     numberRaw = latest.numberRaw,
                     displayName = named?.name?.trim() ?: latest.numberRaw,
                     callCount = list.size,
@@ -767,6 +827,42 @@ object VaultLogic {
         return (clamped * (itemCount - 1)).roundToInt().coerceIn(0, itemCount - 1)
     }
 
+    /**
+     * How long the list must sit idle before the scrubber hides
+     * (v1.3.0, issue #14; quickened to 1200ms in v1.3.1), and the
+     * pure visibility decision behind it: while the thumb is
+     * being dragged it always shows, otherwise it shows until
+     * the idle time reaches the threshold, and at or past the
+     * threshold it hides. The activity owns the timer; this
+     * only decides.
+     */
+    const val SCRUB_IDLE_FADE_MS = 1200L
+
+    fun shouldScrubberShow(
+        isDragging: Boolean,
+        idleMs: Long,
+        thresholdMs: Long = SCRUB_IDLE_FADE_MS
+    ): Boolean = isDragging || idleMs < thresholdMs
+
+    /**
+     * Uniform shrink hide and slow smooth show (v1.3.2,
+     * replacing the v1.3.1 scaleX only collapse, which read as
+     * a sideways squeeze, and the fast 220ms overshoot pop,
+     * which read as a jerk): the hide shrinks the pill
+     * proportionally, both axes together, from 1 down to
+     * SCRUB_HIDDEN_SCALE over SCRUB_HIDE_MS, and the show
+     * grows it back from that same small size to 1 over
+     * SCRUB_SHOW_MS with a gentle ease. The show starts at
+     * the hidden size only when the pill was hidden; an
+     * already visible pill needs no start state change.
+     */
+    const val SCRUB_HIDE_MS = 250L
+    const val SCRUB_SHOW_MS = 380L
+    const val SCRUB_HIDDEN_SCALE = 0.25f
+
+    fun scrubShowStartScale(wasHidden: Boolean): Float =
+        if (wasHidden) SCRUB_HIDDEN_SCALE else 1f
+
     /** Display name for a document tree id like "primary:Download/Backups". */
     fun folderNameFromTreeId(docId: String): String {
         val tail = docId.substringAfterLast('/').substringAfterLast(':').trim()
@@ -810,6 +906,27 @@ object VaultLogic {
     /** Subtitle of a person row: number, call count and total talk time. */
     fun personSubtitle(numberRaw: String, callCount: Int, totalDurationSec: Long): String =
         numberRaw + "  ·  " + callCount + " calls  ·  " + formatDuration(totalDurationSec) + " total"
+
+    /**
+     * Person row subtitle under the privacy toggle (v1.4.0): with
+     * stats on it is the full subtitle; with stats off it is just
+     * the number, so no count or talk time leaks into the list.
+     */
+    fun personRowSubtitle(numberRaw: String, callCount: Int, totalDurationSec: Long, showStats: Boolean): String =
+        if (showStats) personSubtitle(numberRaw, callCount, totalDurationSec) else numberRaw
+
+    /** People mode only counts when the People menu itself is on (v1.4.0). */
+    fun effectivePeopleMode(requestedPeople: Boolean, showPeopleMenu: Boolean): Boolean =
+        requestedPeople && showPeopleMenu
+
+    /**
+     * The What's New popup fires once per version: whenever the
+     * stored last shown version differs from the running one,
+     * including a first install (stored 0), so upgraders from any
+     * older build see it exactly once.
+     */
+    fun shouldShowWhatsNew(lastShownVersion: Int, currentVersion: Int): Boolean =
+        lastShownVersion != currentVersion
 
     /** Top right text of a person row: Today or Yesterday, else the short date. */
     fun personRightTop(lastDateMs: Long, nowMs: Long): String {
@@ -965,6 +1082,26 @@ object VaultLogic {
         APPEARANCE_AMOLED -> "AMOLED"
         APPEARANCE_AUTO -> "Auto"
         else -> "AMOLED"
+    }
+
+    /**
+     * File Master bar surfaces (v1.3.3, taken verbatim from FM
+     * Theme.barDrawable in ~/workspace/file-master, which is the
+     * locked flat look after the glass saga closed): solid quiet
+     * fills, no gradient, no blur, no translucency. Light white,
+     * dark #2C2C2E, AMOLED #1C1C1E. Hairline black 10 percent on
+     * light (FM withAlpha rounds to 0x1A), white 12 percent on
+     * dark and AMOLED (FM withAlpha rounds to 0x1F).
+     */
+    fun solidBarFill(appearance: Int): Int = when (appearance) {
+        APPEARANCE_LIGHT -> 0xFFFFFFFF.toInt()
+        APPEARANCE_AMOLED -> 0xFF1C1C1E.toInt()
+        else -> 0xFF2C2C2E.toInt()
+    }
+
+    fun solidBarStroke(appearance: Int): Int = when (appearance) {
+        APPEARANCE_LIGHT -> 0x1A000000.toInt()
+        else -> 0x1FFFFFFF.toInt()
     }
 
     // ------------------------------------------------------------------ XML

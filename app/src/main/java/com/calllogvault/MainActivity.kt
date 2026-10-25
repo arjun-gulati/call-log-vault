@@ -13,8 +13,8 @@ import android.graphics.Color
 import android.graphics.Typeface
 import android.graphics.drawable.Drawable
 import android.graphics.drawable.GradientDrawable
-import android.graphics.drawable.LayerDrawable
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
@@ -91,7 +91,7 @@ class MainActivity : Activity() {
     private lateinit var watchLabel: TextView
     private lateinit var pageTitle: TextView
     private lateinit var scrollTopButton: TextView
-    // Fast scroll scrubber (v1.2.7): the glass thumb docked to
+    // Fast scroll scrubber (v1.2.7): the solid thumb docked to
     // the right edge of the list area, shorter and wider since
     // v1.2.9, plus the section bubble that rides beside it while
     // it is dragged. scrubbing marks a live drag: the finger then
@@ -102,6 +102,45 @@ class MainActivity : Activity() {
     private var scrubbing = false
     private var scrubStartY = 0f
     private var scrubStartFraction = 0f
+    // Idle hide (v1.3.0, issue #14; animation reworked in
+    // v1.3.1, then again in v1.3.2): once the list has sat
+    // idle for SCRUB_IDLE_FADE_MS the thumb shrinks
+    // proportionally into the right edge, and any scroll
+    // start grows it back out smoothly. scrubbing is the
+    // live drag (never hides), scrubScrolling tracks the
+    // list state, scrubFadedOut is the hidden state that
+    // layout rechecks must not resurrect on their own.
+    private val scrubHandler = Handler(Looper.getMainLooper())
+    private var scrubScrolling = false
+    private var scrubFadedOut = false
+    private val scrubFadeRunnable = Runnable {
+        if (scrubbing || scrubScrolling || !scrubberAvailable()) return@Runnable
+        scrubPill.animate().cancel()
+        // Uniform shrink toward the right edge: pivot on the
+        // edge itself at mid height, both axes together, so
+        // the pill keeps its proportions as it disappears
+        // into the edge instead of being squeezed sideways
+        // (v1.3.2: the v1.3.1 scaleX only collapse read as
+        // cheap on device).
+        scrubPill.pivotX = scrubPillRightEdgePx()
+        scrubPill.pivotY = scrubPill.height / 2f
+        scrubPill.animate()
+            .scaleX(VaultLogic.SCRUB_HIDDEN_SCALE)
+            .scaleY(VaultLogic.SCRUB_HIDDEN_SCALE)
+            .alpha(0f)
+            .setDuration(VaultLogic.SCRUB_HIDE_MS)
+            .withEndAction {
+                if (!scrubbing && !scrubScrolling) {
+                    scrubPill.visibility = View.GONE
+                    scrubFadedOut = true
+                }
+            }.start()
+    }
+
+    /** The pill's right edge in pixels, for the shrink pivot. */
+    private fun scrubPillRightEdgePx(): Float =
+        if (::scrubPill.isInitialized && scrubPill.width > 0) scrubPill.width.toFloat()
+        else dp(SCRUB_PILL_WIDTH_DP).toFloat()
 
     // Drawer views
     private lateinit var scrim: View
@@ -301,6 +340,9 @@ class MainActivity : Activity() {
         CrashLog.install(this)
         dpF = resources.displayMetrics.density
         buildUi()
+        // What's New once per version (v1.4.0): posted, so it never
+        // blocks the first load or the silent sync.
+        frame.post { showWhatsNewIfNeeded() }
         armSnifferOnce()
         updatePermState()
         updateWatchIndicator()
@@ -540,6 +582,17 @@ class MainActivity : Activity() {
                     // Every state change (a fling starting, a scroll
                     // settling idle) earns a post layout recheck, so
                     // the pill is never left stale (v1.2.6).
+                    // Idle hide (v1.3.0, issue #14; animation
+                    // in v1.3.2): any scroll start grows the
+                    // scrubber back out from the right edge, and
+                    // settling idle starts the hide timer.
+                    if (scrollState == AbsListView.OnScrollListener.SCROLL_STATE_IDLE) {
+                        scrubScrolling = false
+                        if (!scrubbing) scheduleScrubFade()
+                    } else {
+                        scrubScrolling = true
+                        showScrubberNow()
+                    }
                     scheduleScrollTopCheck()
                 }
 
@@ -637,7 +690,7 @@ class MainActivity : Activity() {
         // from ScrollToTopMachine, rendered by
         // renderScrollToTopButton() with a translucent gradient,
         // a bright hairline stroke and a real shadow, so it reads
-        // as glass floating over the rows on every theme, AMOLED
+        // as a solid pill floating over the rows on every theme, AMOLED
         // included. It is added last in the list area, and the
         // render brings it to the front again, so no sibling can
         // ever cover it.
@@ -665,13 +718,13 @@ class MainActivity : Activity() {
 
         // Fast scroll scrubber (v1.2.7): what Arjun meant by
         // "scroll helper" all along (his v1.2.6 screenshot arrow
-        // pointed at the right edge scrollbar all along): a glass
+        // pointed at the right edge scrollbar all along): a solid
         // thumb docked to the right edge of the list area whose
         // short drag scrubs the whole history, the scroll
         // multiplier feel. v1.2.9 reshapes it iOS style: shorter
         // and wider at rest, springing larger while it is held and
-        // shrinking back on release, in a layered frosted glass
-        // skin (see scrubGlassBackground). It is a sibling of the
+        // shrinking back on release, in the solid File Master bar
+        // surface (see solidBarBackground). It is a sibling of the
         // list like the scroll to top pill, never a row: touches
         // that land on it are consumed by its own touch listener
         // and nothing else in the list ever sees them, and every
@@ -687,7 +740,7 @@ class MainActivity : Activity() {
             setTextColor(color(R.color.text))
             gravity = Gravity.CENTER
             setPadding(dp(12), dp(7), dp(12), dp(7))
-            background = scrubGlassBackground(dp(14))
+            background = solidBarBackground(14)
             elevation = dp(12).toFloat()
             visibility = View.GONE
             isClickable = false
@@ -704,7 +757,7 @@ class MainActivity : Activity() {
         scrubPill = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             gravity = Gravity.CENTER
-            background = scrubGlassBackground(dp(SCRUB_PILL_WIDTH_DP / 2))
+            background = solidBarBackground(SCRUB_PILL_WIDTH_DP / 2)
             elevation = dp(SCRUB_REST_ELEVATION_DP).toFloat()
             alpha = SCRUB_REST_ALPHA
             visibility = View.GONE
@@ -719,7 +772,7 @@ class MainActivity : Activity() {
                     background = GradientDrawable().apply {
                         shape = GradientDrawable.RECTANGLE
                         cornerRadius = dp(1).toFloat()
-                        setColor(glassColor(color(R.color.text), 200))
+                        setColor(color(R.color.text))
                     }
                 }, LinearLayout.LayoutParams(dp(16), dp(2)).apply {
                     if (i > 0) topMargin = dp(3)
@@ -851,10 +904,14 @@ class MainActivity : Activity() {
             closeDrawer()
             setMode(people = false)
         }.first)
-        body.addView(drawerRow(R.drawable.ic_nav_people, "People", null) {
-            closeDrawer()
-            setMode(people = true)
-        }.first)
+        // The People entry itself is hidden while the privacy toggle
+        // is off (v1.4.0); the data stays in the vault.
+        if (UiKit.showPeopleMenu(this)) {
+            body.addView(drawerRow(R.drawable.ic_nav_people, "People", null) {
+                closeDrawer()
+                setMode(people = true)
+            }.first)
+        }
 
         body.addView(eyebrow("BACKUP AND RESTORE"))
         body.addView(drawerRow(R.drawable.ic_nav_backup, "Backup to ZIP", null) {
@@ -904,6 +961,39 @@ class MainActivity : Activity() {
         body.addView(drawerRow(R.drawable.ic_nav_info, "Status and about", null) {
             closeDrawer()
             showInfo()
+        }.first)
+        body.addView(drawerRow(R.drawable.ic_nav_info, "What's new", null) {
+            closeDrawer()
+            showWhatsNewDialog()
+        }.first)
+
+        body.addView(eyebrow("PRIVACY"))
+        body.addView(switchRow(
+            R.drawable.ic_nav_log,
+            "Show call details",
+            "First call, last call, total calls and total talk time",
+            UiKit.showCallDetails(this)
+        ) { checked ->
+            if (UiKit.showCallDetails(this@MainActivity) != checked) {
+                UiKit.setShowCallDetails(this@MainActivity, checked)
+                rebuildItems()
+            }
+        }.first)
+        body.addView(switchRow(
+            R.drawable.ic_nav_people,
+            "Show People menu",
+            "Hide the whole People section",
+            UiKit.showPeopleMenu(this)
+        ) { checked ->
+            if (UiKit.showPeopleMenu(this@MainActivity) != checked) {
+                UiKit.setShowPeopleMenu(this@MainActivity, checked)
+                // The drawer rows are built once, so a recreate is
+                // what adds or removes the People entry, same as the
+                // theme switches below. A restart always lands on
+                // Call log, so turning the menu off mid People page
+                // falls back cleanly.
+                recreate()
+            }
         }.first)
 
         body.addView(eyebrow("THEME"))
@@ -1477,7 +1567,10 @@ class MainActivity : Activity() {
     }
 
     private fun setMode(people: Boolean) {
-        val switching = people != peopleMode
+        // People is unreachable while its menu is off (v1.4.0):
+        // a stale request falls back to Call log instead of opening it.
+        val target = VaultLogic.effectivePeopleMode(people, UiKit.showPeopleMenu(this))
+        val switching = target != peopleMode
         if (switching) {
             // Issue #6: capture the outgoing page exactly where it
             // is, then kill its momentum before any item changes.
@@ -1487,9 +1580,9 @@ class MainActivity : Activity() {
             stopListMomentum()
             cancelScrollToTopWork()
         }
-        peopleMode = people
+        peopleMode = target
         pageTitle.text = VaultLogic.mainPageTitle(peopleMode)
-        chipScroll.visibility = if (people) View.GONE else View.VISIBLE
+        chipScroll.visibility = if (target) View.GONE else View.VISIBLE
         rebuildItems()
         if (switching) {
             restorePageScrollState(peopleMode)
@@ -1616,97 +1709,47 @@ class MainActivity : Activity() {
         renderScrollToTopButton()
     }
 
-    /** An opaque theme colour restated at [alpha] (0 to 255). */
-    private fun glassColor(opaque: Int, alpha: Int): Int = Color.argb(
-        alpha.coerceIn(0, 255),
-        Color.red(opaque), Color.green(opaque), Color.blue(opaque)
-    )
-
     /**
-     * The pill's glass skin for one state (v1.2.6): a two stop
-     * translucent gradient (lighter at the top, like light through
-     * glass), a bright hairline stroke, and the view's elevation
-     * shadow underneath. Framework GradientDrawable only, so it
-     * renders identically from API 26 up; no blur API is needed
-     * because the translucency is in the fill itself.
+     * The pills' solid skin (v1.3.3): File Master's bar surface,
+     * taken verbatim from FM Theme.barDrawable, which is the
+     * locked flat look after the glass saga closed. No glass,
+     * no frost, no translucency, no gradient, no blur, no
+     * sheen: one fully opaque fill per theme (light white,
+     * dark #2C2C2E, AMOLED #1C1C1E) with a 1dp hairline, plus
+     * the view's elevation for the soft shadow. The fill and
+     * stroke come from VaultLogic.solidBarFill/solidBarStroke
+     * so the mapping is unit tested. Light theme contrast:
+     * the white fill sits on the #F7F9FB list page, and the
+     * pill's definition comes from the black 10 percent
+     * hairline, the 12dp elevation shadow, and the dark grip
+     * and text, not from translucency.
      */
-    private fun scrollTopGlassBackground(state: ScrollToTopMachine.State): GradientDrawable {
-        val card = color(R.color.card)
-        val primary = color(R.color.primary)
-        val green = color(R.color.green)
-        val (top, bottom, stroke) = when (state) {
-            ScrollToTopMachine.State.RETURNING -> Triple(
-                glassColor(primary, 242),
-                glassColor(color(R.color.primary_dark), 232),
-                glassColor(color(R.color.on_primary), 130)
-            )
-            ScrollToTopMachine.State.ARRIVED -> Triple(
-                glassColor(UiKit.blendOver(card, green, 0.38f), 238),
-                glassColor(UiKit.blendOver(card, green, 0.22f), 224),
-                glassColor(green, 190)
-            )
-            else -> Triple(
-                glassColor(UiKit.blendOver(card, primary, 0.20f), 232),
-                glassColor(UiKit.blendOver(card, primary, 0.10f), 214),
-                glassColor(primary, 165)
-            )
-        }
-        return GradientDrawable(
-            GradientDrawable.Orientation.TL_BR, intArrayOf(top, bottom)
-        ).apply {
-            cornerRadius = dp(24).toFloat()
-            setStroke(dp(1), stroke)
+    private fun solidBarBackground(cornerDp: Int): GradientDrawable {
+        val appearance = UiKit.concreteAppearance(this)
+        return GradientDrawable().apply {
+            shape = GradientDrawable.RECTANGLE
+            cornerRadius = dp(cornerDp).toFloat()
+            setColor(VaultLogic.solidBarFill(appearance))
+            setStroke(dp(1), VaultLogic.solidBarStroke(appearance))
         }
     }
 
     /**
-     * The scrubber's glass skin (v1.2.9): a layered frosted
-     * glass, replacing the v1.2.7 two stop translucency. Three
-     * framework drawables are stacked: a three stop body, bright
-     * at the top like light catching a pane and settling to a
-     * deeper foot, with a stronger hairline stroke; a sheen that
-     * fades white out down the face, the frost; and a thin inner
-     * edge line inset one dp, which reads as the pane's own
-     * thickness catching light. The view's elevation lays the
-     * soft shadow under all of it. Framework drawables only, API
-     * 26 up, no backdrop blur: blurring what sits behind an
-     * arbitrary view is not something the framework offers, so
-     * the frost here is built from the layers, not faked from a
-     * capture. Colours come from the theme palette, so the pane
-     * reads as glass on AMOLED black and on light themes alike.
+     * The scroll to top pill's solid skin for one state
+     * (v1.3.3): the bar surface, except while returning,
+     * when the pill is the solid primary fill with the
+     * on-primary text the render already sets.
      */
-    private fun scrubGlassBackground(cornerDp: Int): Drawable {
-        val card = color(R.color.card)
-        val primary = color(R.color.primary)
-        val radius = dp(cornerDp).toFloat()
-        val body = GradientDrawable(
-            GradientDrawable.Orientation.TOP_BOTTOM,
-            intArrayOf(
-                glassColor(UiKit.blendOver(card, Color.WHITE, 0.50f), 242),
-                glassColor(UiKit.blendOver(card, primary, 0.18f), 232),
-                glassColor(UiKit.blendOver(card, primary, 0.06f), 216)
-            )
-        ).apply {
-            cornerRadius = radius
-            setStroke(dp(1), glassColor(primary, 205))
+    private fun scrollTopSolidBackground(state: ScrollToTopMachine.State): Drawable {
+        if (state == ScrollToTopMachine.State.RETURNING) {
+            return GradientDrawable().apply {
+                shape = GradientDrawable.RECTANGLE
+                cornerRadius = dp(24).toFloat()
+                setColor(color(R.color.primary))
+                setStroke(dp(1), color(R.color.primary_dark))
+            }
         }
-        val sheen = GradientDrawable(
-            GradientDrawable.Orientation.TOP_BOTTOM,
-            intArrayOf(glassColor(Color.WHITE, 115), glassColor(Color.WHITE, 0))
-        ).apply {
-            cornerRadius = radius
-        }
-        val innerEdge = GradientDrawable().apply {
-            shape = GradientDrawable.RECTANGLE
-            cornerRadius = radius
-            setColor(Color.TRANSPARENT)
-            setStroke(dp(1), glassColor(Color.WHITE, 70))
-        }
-        return LayerDrawable(arrayOf(body, sheen, innerEdge)).apply {
-            val inset = dp(1)
-            setLayerInset(1, inset, inset, inset, inset)
-            setLayerInset(2, inset, inset, inset, inset)
-        }
+        return solidBarBackground(24)
     }
 
     /**
@@ -1725,9 +1768,69 @@ class MainActivity : Activity() {
      * scroll to top pill honest, so it costs one fraction read and
      * one translation per event, nothing more.
      */
+    /**
+     * Idle hide helpers (v1.3.0, issue #14; show/hide animation
+     * reworked in v1.3.1 and v1.3.2). The hide timer only ever
+     * starts on a real idle transition or a drag release, so
+     * the thumb never hides on first sight, only after
+     * scrolling has settled. showScrubberNow cancels any hide
+     * in flight: a hidden pill grows back out from the right
+     * edge smoothly, an already visible one is restored
+     * smoothly if caught mid hide (a grab owns its scale while
+     * dragging, so a show never touches a held pill).
+     */
+    private fun scheduleScrubFade() {
+        scrubHandler.removeCallbacks(scrubFadeRunnable)
+        scrubHandler.postDelayed(scrubFadeRunnable, VaultLogic.SCRUB_IDLE_FADE_MS)
+    }
+
+    private fun cancelScrubFade() {
+        scrubHandler.removeCallbacks(scrubFadeRunnable)
+    }
+
+    private fun showScrubberNow() {
+        cancelScrubFade()
+        if (!::scrubPill.isInitialized) return
+        if (scrubbing) return
+        val wasHidden = scrubFadedOut || scrubPill.visibility != View.VISIBLE
+        scrubFadedOut = false
+        scrubPill.animate().cancel()
+        if (!wasHidden) {
+            // Already on screen but possibly caught mid hide:
+            // a cancelled hide must not leave it half collapsed,
+            // and the restore is a smooth grow, not a snap
+            // (v1.3.2: the fast pop read as a jerk on device).
+            if (scrubPill.scaleX < 1f || scrubPill.scaleY < 1f ||
+                scrubPill.alpha < SCRUB_REST_ALPHA
+            ) {
+                scrubPill.pivotX = scrubPillRightEdgePx()
+                scrubPill.pivotY = scrubPill.height / 2f
+                scrubPill.animate()
+                    .scaleX(1f).scaleY(1f).alpha(SCRUB_REST_ALPHA)
+                    .setDuration(VaultLogic.SCRUB_SHOW_MS)
+                    .setInterpolator(DecelerateInterpolator())
+                    .start()
+            }
+            return
+        }
+        scrubPill.visibility = View.VISIBLE
+        scrubPill.pivotX = scrubPillRightEdgePx()
+        scrubPill.pivotY = scrubPill.height / 2f
+        scrubPill.scaleX = VaultLogic.scrubShowStartScale(true)
+        scrubPill.scaleY = VaultLogic.scrubShowStartScale(true)
+        scrubPill.alpha = 0f
+        scrubPill.animate()
+            .scaleX(1f).scaleY(1f).alpha(SCRUB_REST_ALPHA)
+            .setDuration(VaultLogic.SCRUB_SHOW_MS)
+            .setInterpolator(DecelerateInterpolator())
+            .start()
+    }
+
     private fun refreshScrubber() {
         if (!::scrubPill.isInitialized) return
         if (!scrubberAvailable()) {
+            cancelScrubFade()
+            scrubFadedOut = false
             if (scrubbing) endScrub()
             if (scrubPill.visibility != View.GONE) {
                 scrubPill.visibility = View.GONE
@@ -1735,9 +1838,19 @@ class MainActivity : Activity() {
             }
             return
         }
+        // Faded out and still idle: layout rechecks and scroll
+        // callbacks must not resurrect the thumb on their own.
+        // Only a scroll start (showScrubberNow) or a grab does.
+        if (scrubFadedOut && !scrubbing && !scrubScrolling) return
         if (scrubPill.visibility != View.VISIBLE) {
             scrubPill.visibility = View.VISIBLE
-            if (!scrubbing) scrubPill.alpha = SCRUB_REST_ALPHA
+            if (!scrubbing) {
+                // A re-show after a page switch must never
+                // inherit the hidden shrink scale.
+                scrubPill.scaleX = 1f
+                scrubPill.scaleY = 1f
+                scrubPill.alpha = SCRUB_REST_ALPHA
+            }
         }
         if (scrubbing) return
         val fraction = VaultLogic.scrollFraction(
@@ -1805,6 +1918,11 @@ class MainActivity : Activity() {
         when (event.actionMasked) {
             MotionEvent.ACTION_DOWN -> {
                 if (!scrubberAvailable()) return false
+                // A grab never meets a fading thumb: cancel the
+                // fade and make sure the thumb is on screen.
+                cancelScrubFade()
+                scrubFadedOut = false
+                scrubPill.visibility = View.VISIBLE
                 scrubbing = true
                 scrubStartY = event.rawY
                 scrubStartFraction = VaultLogic.scrollFraction(
@@ -1875,10 +1993,16 @@ class MainActivity : Activity() {
             .setInterpolator(OvershootInterpolator(1.4f))
             .start()
         refreshScrubber()
+        // A released drag restarts the idle timer when the list
+        // itself is already idle (v1.3.0, issue #14); if it is
+        // still moving, the idle transition will start it. The
+        // availability guard keeps a teardown path from arming
+        // a timer for a list that is no longer there.
+        if (!scrubScrolling && scrubberAvailable()) scheduleScrubFade()
     }
 
     /**
-     * The pill in its machine state: words, glass, clickability,
+     * The pill in its machine state: words, solid fill, clickability,
      * and the spring motion for the transition. Repeated renders in
      * the same state only refresh the content; animations fire on
      * transitions, tracked in [scrollTopRenderedState]. When the
@@ -1915,7 +2039,7 @@ class MainActivity : Activity() {
             ScrollToTopMachine.State.ARRIVED -> "At the top"
             ScrollToTopMachine.State.HIDDEN -> "Scroll to top"
         }
-        scrollTopButton.background = scrollTopGlassBackground(state)
+        scrollTopButton.background = scrollTopSolidBackground(state)
         scrollTopButton.setTextColor(
             when (state) {
                 ScrollToTopMachine.State.RETURNING -> color(R.color.on_primary)
@@ -2138,6 +2262,10 @@ class MainActivity : Activity() {
         // v1.2.7: the scrubber hides with the pill on a page switch
         // or a blocked list; the rechecks behind the switch re-show
         // it mirrored to whichever page and position lands.
+        // v1.3.0: a switch is a fresh context, so a faded out
+        // thumb is cleared here and the rechecks may show it again.
+        cancelScrubFade()
+        scrubFadedOut = false
         if (::scrubPill.isInitialized && !scrubbing) {
             scrubPill.visibility = View.GONE
             scrubBubble.visibility = View.GONE
@@ -2947,7 +3075,10 @@ class MainActivity : Activity() {
                 val (initials, bg, fg) = avatarColorsFor(p.displayName, p.numberRaw, p.numberNorm, palette)
                 val display = RowDisplay(
                     title = p.displayName,
-                    subtitle = VaultLogic.personSubtitle(p.numberRaw, p.callCount, p.totalDurationSec),
+                    subtitle = VaultLogic.personRowSubtitle(
+                        p.numberRaw, p.callCount, p.totalDurationSec,
+                        UiKit.showCallDetails(this)
+                    ),
                     rightTop = VaultLogic.personRightTop(p.lastDateMs, now),
                     rightBottom = VaultLogic.formatTime(p.lastDateMs),
                     avatarInitials = initials,
@@ -3327,6 +3458,46 @@ class MainActivity : Activity() {
         return card
     }
 
+    /**
+     * What's New (v1.4.0): written in the simplest language, covering
+     * everything since the last public release (v1.2.9), because the
+     * 1.3.x builds were never published. No em dashes, no jargon.
+     */
+    private val whatsNewText: String =
+        "• One call now reads 1 CALL, not 1 CALLS.\n" +
+        "• A person saved with and without a country code now shows as one person.\n" +
+        "• The side scroller now fades and shrinks away smoothly after you scroll, and grows back gently.\n" +
+        "• The pills now use calm solid colours with no glass look, and the scroller is easy to see on white screens.\n" +
+        "• New privacy options in the menu: you can hide call details like first call, last call, total calls and total talk time, and you can hide the whole People section.\n" +
+        "• This popup is new too. It appears once after each update, so you always know what changed."
+
+    /** Version code of the running build, 0 when it cannot be read. */
+    private fun currentVersionCode(): Int = try {
+        val pi = packageManager.getPackageInfo(packageName, 0)
+        if (Build.VERSION.SDK_INT >= 28) pi.longVersionCode.toInt() else pi.versionCode
+    } catch (e: Exception) {
+        0
+    }
+
+    /** Show the What's New popup once per version, then record it. */
+    private fun showWhatsNewIfNeeded() {
+        val current = currentVersionCode()
+        if (current <= 0) return
+        if (!VaultLogic.shouldShowWhatsNew(UiKit.whatsNewShownVersion(this), current)) return
+        UiKit.setWhatsNewShownVersion(this, current)
+        showWhatsNewDialog()
+    }
+
+    /** The What's New popup itself, also reopened from the drawer. */
+    private fun showWhatsNewDialog() {
+        VaultDialog.message(
+            this,
+            "What's new in " + versionName(),
+            whatsNewText,
+            "Got it"
+        )
+    }
+
     private fun showInfo() {
         val helper = VaultDb.get(this)
         val db = helper.readableDatabase
@@ -3518,15 +3689,30 @@ class MainActivity : Activity() {
         // and grows while held: scale to SCRUB_HELD_SCALE with a
         // springy overshoot on the grab, back to 1x on the release,
         // with the shadow deepening while it is in the hand.
+        // v1.3.2 restyles it in the frosted language.
+        // v1.3.3 replaces the frost with the solid File Master
+        // bar surface (see solidBarBackground).
         private const val SCRUB_MIN_ITEMS = 25
         private const val SCRUB_PILL_WIDTH_DP = 36
         private const val SCRUB_PILL_HEIGHT_DP = 44
         private const val SCRUB_TRACK_TOP_DP = 8
         private const val SCRUB_TRACK_BOTTOM_DP = 84
-        private const val SCRUB_REST_ALPHA = 0.55f
+        // v1.3.3: the pill rests fully opaque. The 0.55 rest alpha
+        // belonged to the glass era; on a white list it halved
+        // the hairline, the shadow and the grip along with the
+        // fill, which is exactly the white-theme blending Arjun
+        // reported. A solid File Master bar is opaque, and so
+        // is this pill now.
+        private const val SCRUB_REST_ALPHA = 1.0f
         private const val SCRUB_HELD_SCALE = 1.25f
         private const val SCRUB_GRAB_MS = 220L
         private const val SCRUB_RELEASE_MS = 240L
+        // v1.3.0 idle hide (issue #14), animation reworked in
+        // v1.3.1 and again in v1.3.2: the hide shrinks the pill
+        // proportionally into the right edge and the show grows
+        // it back smoothly; durations live in VaultLogic
+        // (SCRUB_HIDE_MS / SCRUB_SHOW_MS), the wait before the
+        // hide is VaultLogic.SCRUB_IDLE_FADE_MS.
         private const val SCRUB_REST_ELEVATION_DP = 12
         private const val SCRUB_HELD_ELEVATION_DP = 18
         private const val REQ_PERMISSIONS = 100
