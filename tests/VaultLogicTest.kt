@@ -67,6 +67,11 @@ fun main() {
     testScrollToTop()
     testBin()
     testPause()
+    testSolidBar()
+    testCallCountLabel()
+    testScrubberIdleShow()
+    testGroupingNumberVariants()
+    testPrivacyWhatsNew()
     println("CHECKS=$checks FAILURES=$failures")
     println(if (failures == 0) "ALL_VAULT_TESTS_PASSED" else "VAULT_TEST_FAILURES=$failures")
     if (failures > 0) kotlin.system.exitProcess(1)
@@ -246,6 +251,77 @@ fun testGrouping() {
     check("display name from named call", asha.displayName == "Asha")
     check("unnamed person shows number", people[0].displayName == "222")
     check("empty list groups empty", VaultLogic.groupPeople(emptyList()).isEmpty())
+}
+
+fun testCallCountLabel() {
+    println("== callCountLabel (issue #12) ==")
+    check("zero is plural", VaultLogic.callCountLabel(0) == "Calls")
+    check("one is singular", VaultLogic.callCountLabel(1) == "Call")
+    check("two is plural", VaultLogic.callCountLabel(2) == "Calls")
+    check("one hundred is plural", VaultLogic.callCountLabel(100) == "Calls")
+}
+
+fun testScrubberIdleShow() {
+    println("== shouldScrubberShow (issue #14, timing quickened in v1.3.1) ==")
+    check("dragging always shows, even long idle", VaultLogic.shouldScrubberShow(true, 100000L))
+    check("fresh idle shows", VaultLogic.shouldScrubberShow(false, 0L))
+    check("just under threshold shows", VaultLogic.shouldScrubberShow(false, 1199L))
+    check("at threshold hides", !VaultLogic.shouldScrubberShow(false, 1200L))
+    check("past threshold hides", !VaultLogic.shouldScrubberShow(false, 10000L))
+    check("threshold constant is 1200ms", VaultLogic.SCRUB_IDLE_FADE_MS == 1200L)
+    check("hide duration is 250ms", VaultLogic.SCRUB_HIDE_MS == 250L)
+    check("show duration is 380ms", VaultLogic.SCRUB_SHOW_MS == 380L)
+    check("hidden scale is 0.25", VaultLogic.SCRUB_HIDDEN_SCALE == 0.25f)
+    check("show from hidden starts at hidden scale", VaultLogic.scrubShowStartScale(true) == 0.25f)
+    check("show from visible starts full", VaultLogic.scrubShowStartScale(false) == 1f)
+    check("show start from hidden equals hidden scale", VaultLogic.scrubShowStartScale(true) == VaultLogic.SCRUB_HIDDEN_SCALE)
+    check("hidden scale keeps proportions (under 1, above 0)", VaultLogic.SCRUB_HIDDEN_SCALE > 0f && VaultLogic.SCRUB_HIDDEN_SCALE < 1f)
+}
+
+fun testGroupingNumberVariants() {
+    println("== grouping number variants (issue #13) ==")
+    // The requester's example, both orders: +1 22233 and plain 22233.
+    val withCode = rec(number = "+1 22233", name = "Sam", date = 1000, duration = 10)
+    val plain = rec(number = "22233", name = "Sam", date = 2000, duration = 20)
+    val merged = VaultLogic.groupPeople(listOf(withCode, plain))
+    check("country code and plain merge", merged.size == 1)
+    check("merged count is both calls", merged[0].callCount == 2)
+    check("merged durations sum", merged[0].totalDurationSec == 30L)
+    check("representative is the longest digit form", merged[0].numberNorm == "+122233")
+    check("display name from named calls", merged[0].displayName == "Sam")
+    val mergedReversed = VaultLogic.groupPeople(listOf(plain, withCode))
+    check("merge is order independent", mergedReversed.size == 1 &&
+        mergedReversed[0].numberNorm == "+122233" && mergedReversed[0].callCount == 2)
+    // The 00 international prefix variant: normalizeNumber turns
+    // 00122233 into +122233, which then suffix merges with 22233.
+    val doubleOh = rec(number = "00122233", name = "Sam", date = 3000, duration = 5)
+    val merged00 = VaultLogic.groupPeople(listOf(doubleOh, plain))
+    check("00 prefix variant merges", merged00.size == 1 && merged00[0].callCount == 2)
+    // A plain non-matching pair stays two people.
+    val separate = VaultLogic.groupPeople(
+        listOf(
+            rec(number = "555", name = "Mia", date = 1000, duration = 10),
+            rec(number = "666", name = "Noa", date = 2000, duration = 10)
+        )
+    )
+    check("non matching numbers stay separate", separate.size == 2)
+    // Unknown numbers: unnamed calls to different numbers stay
+    // separate, and show their numbers.
+    val unknown = VaultLogic.groupPeople(
+        listOf(
+            rec(number = "777", name = "", date = 1000, duration = 10),
+            rec(number = "888", name = "", date = 2000, duration = 10)
+        )
+    )
+    check("unknown numbers stay separate", unknown.size == 2)
+    check("unknown shows its number", unknown.all { it.displayName == it.numberRaw })
+    // Name rule across a merge: the most recent NAMED call wins,
+    // even when a newer unnamed variant exists.
+    val namedOld = rec(number = "+1 22233", name = "Sam", date = 1000, duration = 10)
+    val unnamedNew = rec(number = "22233", name = "", date = 2000, duration = 10)
+    val namedMerged = VaultLogic.groupPeople(listOf(namedOld, unnamedNew))
+    check("merged name is the most recent named call", namedMerged[0].displayName == "Sam")
+    check("merged raw is the latest call", namedMerged[0].numberRaw == "22233")
 }
 
 fun testInitials() {
@@ -1159,4 +1235,45 @@ fun testPause() {
     )
     check("merge open pause: the call from during it is refused", openPlan.inserts.none { it.dateMs == t0 + hour })
     check("merge open pause: the earlier call still imports", openPlan.inserts.any { it.dateMs == t0 - hour })
+}
+
+fun testSolidBar() {
+    println("== solid File Master bar fills and strokes (v1.3.3) ==")
+    val light = VaultLogic.APPEARANCE_LIGHT
+    val dark = VaultLogic.APPEARANCE_DARK
+    val amoled = VaultLogic.APPEARANCE_AMOLED
+    // Fills are fully opaque solids from FM Theme.barDrawable.
+    check("bar fill light is opaque white", VaultLogic.solidBarFill(light) == 0xFFFFFFFF.toInt())
+    check("bar fill dark is #2C2C2E", VaultLogic.solidBarFill(dark) == 0xFF2C2C2E.toInt())
+    check("bar fill AMOLED is #1C1C1E", VaultLogic.solidBarFill(amoled) == 0xFF1C1C1E.toInt())
+    check("bar fill unknown falls back to dark", VaultLogic.solidBarFill(99) == 0xFF2C2C2E.toInt())
+    // Hairlines: black 10 percent on light, white 12 percent on dark/AMOLED.
+    check("bar stroke light is black 10 percent", VaultLogic.solidBarStroke(light) == 0x1A000000.toInt())
+    check("bar stroke dark is white 12 percent", VaultLogic.solidBarStroke(dark) == 0x1FFFFFFF.toInt())
+    check("bar stroke AMOLED is white 12 percent", VaultLogic.solidBarStroke(amoled) == 0x1FFFFFFF.toInt())
+    // Fills carry no translucency: top byte is FF on all three.
+    check("bar fills are fully opaque", listOf(light, dark, amoled).all {
+        (VaultLogic.solidBarFill(it) ushr 24) == 0xFF
+    })
+    // Dark and AMOLED fills differ from each other and from true black,
+    // so the pill steps off both the dark page and the AMOLED page.
+    check("dark fill differs from AMOLED fill", VaultLogic.solidBarFill(dark) != VaultLogic.solidBarFill(amoled))
+    check("AMOLED fill differs from true black", VaultLogic.solidBarFill(amoled) != 0xFF000000.toInt())
+}
+
+fun testPrivacyWhatsNew() {
+    println("== privacy toggles and whats new (v1.4.0) ==")
+    check("person subtitle with stats on is the full subtitle",
+        VaultLogic.personRowSubtitle("+919000000010", 3, 125, true) ==
+            "+919000000010  ·  3 calls  ·  2m 05s total")
+    check("person subtitle with stats off is just the number",
+        VaultLogic.personRowSubtitle("+919000000010", 3, 125, false) == "+919000000010")
+    check("person subtitle with stats off hides zero stats too",
+        VaultLogic.personRowSubtitle("+919000000010", 0, 0, false) == "+919000000010")
+    check("people mode allowed when menu on", VaultLogic.effectivePeopleMode(true, true))
+    check("people mode blocked when menu off", !VaultLogic.effectivePeopleMode(true, false))
+    check("call log mode unaffected by menu off", !VaultLogic.effectivePeopleMode(false, false))
+    check("whats new shows on first install", VaultLogic.shouldShowWhatsNew(0, 26))
+    check("whats new shows after upgrade", VaultLogic.shouldShowWhatsNew(21, 26))
+    check("whats new hidden once shown for this version", !VaultLogic.shouldShowWhatsNew(26, 26))
 }
