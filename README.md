@@ -27,8 +27,8 @@ Vibe coded by Arjun to solve his own problem, on his own S24 Ultra.
 
 - The app requests exactly 4 permissions: read call log, write call log (for restore), read contacts (to show names), and receive boot completed (so it restarts after a reboot). Nothing else. There is no internet permission to abuse
 - Every backup is a plain ZIP containing CSV, JSON and XML files. Your data is readable by normal tools, never locked into a weird format
-- Verify the download yourself. SHA-256 of the v1.2.9 APK:
-  `bf63d8e97c5345d0d673f1d8c8710af5e06c09558cb3ece166f2b9f1abdc0407`
+- Verify the download yourself. SHA-256 of the v1.4.0 APK:
+  `988b9c34364b436e0fa73f8c8196ce3debcd780419d9b485b46019f0d4220a58`
 - The full source code is in this repo (see below). Do not take anyone's word for what the app does, read it
 
 ## Install
