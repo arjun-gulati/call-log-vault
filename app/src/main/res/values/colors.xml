@@ -14,6 +14,12 @@
     <color name="green">#2FA36B</color>
     <color name="red">#D64545</color>
     <color name="amber">#C77B1F</color>
+    <!-- What's New section colours (v1.4.2): darker than the accents
+         above, so the section labels read as small text on the white
+         dialog card. New 5.35:1, Better 6.88:1, Fixed 6.54:1. -->
+    <color name="whats_new_new">#1E7A46</color>
+    <color name="whats_new_better">#2F5D8A</color>
+    <color name="whats_new_fixed">#B3261E</color>
     <color name="border">#E2E6EB</color>
     <color name="pill_sel_bg">#1F5583BE</color>
     <color name="pill_sel_border">#5583BE</color>
