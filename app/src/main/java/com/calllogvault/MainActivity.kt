@@ -24,6 +24,7 @@ import android.view.Gravity
 import android.view.HapticFeedbackConstants
 import android.view.MotionEvent
 import android.view.View
+import android.view.inputmethod.InputMethodManager
 import android.view.ViewConfiguration
 import android.view.ViewGroup
 import android.view.animation.DecelerateInterpolator
@@ -164,6 +165,10 @@ class MainActivity : Activity() {
     private var allRecords: List<VaultLogic.CallRecord> = emptyList()
     private var people: List<VaultLogic.PersonSummary> = emptyList()
     private var filter: VaultLogic.Filter = VaultLogic.Filter.ALL
+    // People page filter (v1.4.2, issue #18 follow up): its own
+    // state, kept across page switches like the Call Logs filter,
+    // so each page remembers its own filter.
+    private var peopleFilter: VaultLogic.PersonFilter = VaultLogic.PersonFilter.ALL
     private var peopleMode = false
     private var query = ""
     private var syncing = false
@@ -246,6 +251,18 @@ class MainActivity : Activity() {
         RowView.buildIconBitmaps(this, 14) { type -> color(typeTintRes(type)) }
     }
 
+    /**
+     * Large type icons for the Call Logs left circle (v1.4.1,
+     * issue #18), rendered once at avatar size. The tint mirrors
+     * the initials tiles: the type colour blended 0.92 over the
+     * card, on the 0.32 tint the row build puts behind it.
+     */
+    private val avatarIconBitmaps: Map<Int, android.graphics.Bitmap> by lazy {
+        RowView.buildIconBitmaps(this, 24) { type ->
+            UiKit.blendOver(color(R.color.card), color(typeTintRes(type)), 0.92f)
+        }
+    }
+
     /** Shared row text paints and the prebuilt layout factory (v1.0.5). */
     private val rowPaints: RowPaints by lazy { RowPaints(this) }
     private val rowLayoutFactory: RowLayoutFactory by lazy { RowLayoutFactory(rowPaints) }
@@ -297,6 +314,14 @@ class MainActivity : Activity() {
             else -> 1
         }
 
+        // Date headers are labels, not actions (v1.4.1, issue
+        // #17): a disabled position never takes the list's
+        // pressed or focused selector, so holding a date line
+        // can no longer paint a dark background on it.
+        override fun areAllItemsEnabled(): Boolean = false
+        override fun isEnabled(position: Int): Boolean =
+            items.getOrNull(position) !is Item.Header
+
         override fun getView(position: Int, convertView: View?, parent: ViewGroup): View {
             val item = items[position]
             if (item is Item.Header) {
@@ -306,6 +331,9 @@ class MainActivity : Activity() {
                     setTypeface(typeface, Typeface.BOLD)
                     setTextColor(color(R.color.eyebrow))
                     setPadding(dp(20), dp(18), dp(20), dp(6))
+                    isEnabled = false
+                    isClickable = false
+                    isFocusable = false
                 }
                 tv.text = item.text.uppercase(Locale.ENGLISH)
                 return tv
@@ -320,7 +348,7 @@ class MainActivity : Activity() {
             val display = (item as Item.Display).display
             val rv = if (convertView is RowView) convertView else RowView(this@MainActivity)
             rv.layoutFactory = rowLayoutFactory
-            rv.setItem(display, iconBitmaps)
+            rv.setItem(display, iconBitmaps, avatarIconBitmaps)
             return rv
         }
     }
@@ -434,7 +462,11 @@ class MainActivity : Activity() {
             isClickable = true
             isFocusable = true
             pressFeedback()
-            setOnClickListener { if (drawerOpen) closeDrawer() else openDrawer() }
+            setOnClickListener {
+                // Issue #21: opening the menu ends the search.
+                clearSearchFocus()
+                if (drawerOpen) closeDrawer() else openDrawer()
+            }
         }
         topBar.addView(burger)
         pageTitle = TextView(this).apply {
@@ -563,7 +595,13 @@ class MainActivity : Activity() {
             selector = UiKit.rowSelector(this@MainActivity)
             setOnItemClickListener { _, _, position, _ ->
                 when (val item = items.getOrNull(position)) {
-                    is Item.Display -> openPerson(item.display.numberNorm)
+                    // Issue #21: opening an entry ends the search,
+                    // and returning never refocuses the box: nothing
+                    // in this activity requests focus on its own.
+                    is Item.Display -> {
+                        clearSearchFocus()
+                        openPerson(item.display.numberNorm)
+                    }
                     else -> {}
                 }
             }
@@ -591,6 +629,8 @@ class MainActivity : Activity() {
                         if (!scrubbing) scheduleScrubFade()
                     } else {
                         scrubScrolling = true
+                        // Issue #21: a scroll starting ends the search.
+                        clearSearchFocus()
                         showScrubberNow()
                     }
                     scheduleScrollTopCheck()
@@ -705,7 +745,11 @@ class MainActivity : Activity() {
             isClickable = true
             isFocusable = true
             pressFeedback()
-            setOnClickListener { startScrollToTop() }
+            setOnClickListener {
+                // Issue #21: going to the top ends the search.
+                clearSearchFocus()
+                startScrollToTop()
+            }
         }
         listArea.addView(scrollTopButton, FrameLayout.LayoutParams(
             FrameLayout.LayoutParams.WRAP_CONTENT, dp(48),
@@ -993,6 +1037,19 @@ class MainActivity : Activity() {
                 // Call log, so turning the menu off mid People page
                 // falls back cleanly.
                 recreate()
+            }
+        }.first)
+
+        body.addView(eyebrow("DISPLAY"))
+        body.addView(switchRow(
+            R.drawable.ic_nav_people,
+            "Show call count on People icons",
+            "People icons show the number of calls instead of the initial",
+            UiKit.showPeopleCount(this)
+        ) { checked ->
+            if (UiKit.showPeopleCount(this@MainActivity) != checked) {
+                UiKit.setShowPeopleCount(this@MainActivity, checked)
+                rebuildItems()
             }
         }.first)
 
@@ -1566,6 +1623,38 @@ class MainActivity : Activity() {
             AutoBackup.lastCount(this) + " calls"
     }
 
+    /**
+     * Drop search focus and close the keyboard (v1.4.1, issue
+     * #21): the search box only keeps focus while the user is
+     * typing in it. Scrolling, the scrubber, the menu, the back
+     * to top button, a filter, a page switch or opening an entry
+     * all end the search, and returning never refocuses it.
+     * Pressing X is the one exception: it only clears the text
+     * and keeps focus and keyboard, as before.
+     */
+    private fun clearSearchFocus() {
+        if (!::searchEdit.isInitialized) return
+        searchEdit.clearFocus()
+        val imm = getSystemService(Context.INPUT_METHOD_SERVICE) as? InputMethodManager
+        imm?.hideSoftInputFromWindow(searchEdit.windowToken, 0)
+    }
+
+    /**
+     * Clear the search for a page switch (v1.4.1, issue #19):
+     * search is per page, so the query, the box and the focus
+     * all reset when the page changes. The text clear runs the
+     * watcher, which updates the query and the X button; the
+     * rebuild that follows cancels the debounced rebuild the
+     * watcher arms, so no stale query can land after it.
+     */
+    private fun clearSearchForPageSwitch() {
+        if (::searchEdit.isInitialized && searchEdit.text.isNotEmpty()) {
+            searchEdit.text.clear()
+        }
+        query = ""
+        clearSearchFocus()
+    }
+
     private fun setMode(people: Boolean) {
         // People is unreachable while its menu is off (v1.4.0):
         // a stale request falls back to Call log instead of opening it.
@@ -1579,10 +1668,19 @@ class MainActivity : Activity() {
             savePageScrollState(peopleMode)
             stopListMomentum()
             cancelScrollToTopWork()
+            if (VaultLogic.shouldClearSearchOnPageSwitch(switching)) {
+                clearSearchForPageSwitch()
+            }
         }
         peopleMode = target
         pageTitle.text = VaultLogic.mainPageTitle(peopleMode)
-        chipScroll.visibility = if (target) View.GONE else View.VISIBLE
+        // v1.4.2, issue #18 follow up: the chip row now shows on
+        // both pages, with each page's own filters, so the People
+        // filters are visible and usable instead of hidden. The
+        // chips are rebuilt here because the list depends on the
+        // page that just landed.
+        chipScroll.visibility = View.VISIBLE
+        buildChips()
         rebuildItems()
         if (switching) {
             restorePageScrollState(peopleMode)
@@ -1612,6 +1710,11 @@ class MainActivity : Activity() {
             stopListMomentum()
             listView.setSelectionFromTop(target.firstVisiblePosition, target.firstChildOffsetPx)
             updateScrollToTopFromList()
+            // Issue #16: the restore is a jump, not a scroll, so
+            // no IDLE state change ever arms the idle hide for
+            // the page that lands. Arm it here, the same settle
+            // as a return landing.
+            settleScrubberAfterReturn()
             // The read above still races the layout the restore
             // just requested; the posted recheck (and the list's
             // layout listener behind it) settles the pill on the
@@ -1857,6 +1960,15 @@ class MainActivity : Activity() {
             listView.firstVisiblePosition, listView.childCount, items.size
         )
         positionScrubPill(fraction)
+        // Issue #16: a visible pill left by a path that never
+        // reports a scroll state (a restore jump, a data apply)
+        // still needs its idle hide armed, or it strands on
+        // screen. Arming is idempotent: a real scroll cancels
+        // it again, and an idle list simply re-arms the same
+        // 1200ms wait.
+        if (VaultLogic.shouldArmScrubFade(scrubbing, scrubScrolling, scrubberAvailable())) {
+            scheduleScrubFade()
+        }
     }
 
     /**
@@ -1918,6 +2030,8 @@ class MainActivity : Activity() {
         when (event.actionMasked) {
             MotionEvent.ACTION_DOWN -> {
                 if (!scrubberAvailable()) return false
+                // Issue #21: grabbing the pill ends the search.
+                clearSearchFocus()
                 // A grab never meets a fading thumb: cancel the
                 // fade and make sure the thumb is on screen.
                 cancelScrubFade()
@@ -2224,6 +2338,26 @@ class MainActivity : Activity() {
         scrollTopHandler.removeCallbacks(scrollTopWatch)
         scrollTopHandler.removeCallbacks(scrollTopArrivedFinish)
         scrollTopHandler.postDelayed(scrollTopArrivedFinish, SCROLL_TOP_ARRIVED_MS)
+        // Issue #16: the return has landed, so the list is at
+        // rest at the top. The smooth return does not always
+        // deliver a final IDLE state change after its last leg,
+        // so the idle hide is armed here, not only on scroll
+        // state changes, or the pill strands visible when the
+        // press started far down.
+        settleScrubberAfterReturn()
+    }
+
+    /**
+     * Issue #16: settle the scrubber after a return or a page
+     * restore lands: the list is at rest, so the scroll flag
+     * clears and the normal idle hide is armed. A real scroll
+     * cancels it again through showScrubberNow.
+     */
+    private fun settleScrubberAfterReturn() {
+        scrubScrolling = false
+        if (VaultLogic.shouldArmScrubFade(scrubbing, scrubScrolling, scrubberAvailable())) {
+            scheduleScrubFade()
+        }
     }
 
     private val scrollTopArrivedFinish = Runnable {
@@ -2274,23 +2408,47 @@ class MainActivity : Activity() {
 
     // --------------------------------------------------------------- Chips
 
+    /**
+     * Filter chips, per page (v1.4.2, issue #18 follow up). Call
+     * Logs keeps its type chips minus Unknown, which moved to
+     * People: a type icon row no longer needs an unknown filter,
+     * and the chip row now shows on People too (setMode used to
+     * hide it there, because no filter applied). People gets its
+     * own working filters over the grouped summaries: All,
+     * Unknown (no saved contact) and Missed calls. Each page
+     * keeps its own filter state across switches.
+     */
     private fun buildChips() {
         chipRow.removeAllViews()
-        val filters = listOf(
-            VaultLogic.Filter.ALL to "All",
-            VaultLogic.Filter.INCOMING to "Incoming",
-            VaultLogic.Filter.OUTGOING to "Outgoing",
-            VaultLogic.Filter.MISSED to "Missed",
-            VaultLogic.Filter.REJECTED to "Rejected",
-            VaultLogic.Filter.BLOCKED to "Blocked",
-            VaultLogic.Filter.UNKNOWN to "Unknown"
-        )
-        for ((f, label) in filters) {
-            chipRow.addView(makeChip(label, filter == f) {
-                filter = f
-                buildChips()
-                rebuildItems()
-            })
+        if (peopleMode) {
+            val filters = listOf(
+                VaultLogic.PersonFilter.ALL to "All",
+                VaultLogic.PersonFilter.UNKNOWN to "Unknown",
+                VaultLogic.PersonFilter.MISSED to "Missed calls"
+            )
+            for ((f, label) in filters) {
+                chipRow.addView(makeChip(label, peopleFilter == f) {
+                    peopleFilter = f
+                    buildChips()
+                    rebuildItems()
+                })
+            }
+        } else {
+            val filters = listOf(
+                VaultLogic.Filter.ALL to "All",
+                VaultLogic.Filter.INCOMING to "Incoming",
+                VaultLogic.Filter.OUTGOING to "Outgoing",
+                VaultLogic.Filter.MISSED to "Missed",
+                VaultLogic.Filter.REJECTED to "Rejected",
+                VaultLogic.Filter.BLOCKED to "Blocked"
+            )
+            for ((f, label) in filters) {
+                chipRow.addView(makeChip(label, filter == f) {
+                    filter = f
+                    buildChips()
+                    rebuildItems()
+                })
+            }
         }
     }
 
@@ -2308,7 +2466,11 @@ class MainActivity : Activity() {
             setTextColor(color(if (selected) R.color.pill_sel_text else R.color.pill_unsel_text))
             isClickable = true
             pressFeedback()
-            setOnClickListener { onClick() }
+            setOnClickListener {
+                // Issue #21: tapping a filter ends the search.
+                clearSearchFocus()
+                onClick()
+            }
             layoutParams = LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT
             ).apply { rightMargin = dp(8) }
@@ -2907,7 +3069,11 @@ class MainActivity : Activity() {
                 val newCount = helper.count(db)
                 if (!VaultLogic.shouldApplyRebuild(
                         snapshotCount, newCount,
-                        result.added + watch.added + watch.namesUpdated,
+                        // v1.4.1, issue #15: a sync that only renamed
+                        // stored rows (no new calls) still changes
+                        // what the list shows, so it must rebuild too.
+                        result.added + result.namesUpdated +
+                            watch.added + watch.namesUpdated,
                         allRecords.isNotEmpty()
                     )
                 ) {
@@ -3067,26 +3233,34 @@ class MainActivity : Activity() {
             val q = activeQuery.trim()
             val qDigits = q.filter { it.isDigit() }
             val filteredPeople = peopleList.filter { p ->
-                q.isEmpty() ||
-                    p.displayName.lowercase(Locale.ROOT).contains(q.lowercase(Locale.ROOT)) ||
-                    (qDigits.isNotEmpty() && VaultLogic.digitsOnly(p.numberNorm).contains(qDigits))
+                VaultLogic.matchesPersonFilter(p, peopleFilter) && (
+                    q.isEmpty() ||
+                        p.displayName.lowercase(Locale.ROOT).contains(q.lowercase(Locale.ROOT)) ||
+                        (qDigits.isNotEmpty() && VaultLogic.digitsOnly(p.numberNorm).contains(qDigits))
+                )
             }
             filteredPeople.mapIndexed { i, p ->
                 val (initials, bg, fg) = avatarColorsFor(p.displayName, p.numberRaw, p.numberNorm, palette)
+                // People icon (v1.4.2, issue #18 follow up): the
+                // call count when the toggle is on, the initial
+                // when it is off (the default). Exactly one of
+                // the two is set, decided by the pure helpers.
+                val showCount = UiKit.showPeopleCount(this)
                 val display = RowDisplay(
                     title = p.displayName,
                     subtitle = VaultLogic.personRowSubtitle(
-                        p.numberRaw, p.callCount, p.totalDurationSec,
+                        p.numberRaw, p.totalDurationSec,
                         UiKit.showCallDetails(this)
                     ),
                     rightTop = VaultLogic.personRightTop(p.lastDateMs, now),
                     rightBottom = VaultLogic.formatTime(p.lastDateMs),
-                    avatarInitials = initials,
+                    avatarInitials = VaultLogic.peopleAvatarInitials(initials, showCount),
                     avatarBg = bg,
                     avatarFg = fg,
                     typeIcon = -1,
                     showDivider = i < filteredPeople.size - 1,
-                    numberNorm = p.numberNorm
+                    numberNorm = p.numberNorm,
+                    avatarCount = VaultLogic.peopleAvatarCount(p.callCount, showCount)
                 )
                 rowLayoutFactory.buildInto(display, listWidthPx)
                 Item.Display(display)
@@ -3104,19 +3278,30 @@ class MainActivity : Activity() {
                 val next = filtered.getOrNull(i + 1)
                 val divider = next != null &&
                     VaultLogic.dateHeaderLabel(next.dateMs, now) == header
-                val (initials, bg, fg) = avatarColorsFor(r.name, r.numberRaw, r.numberNorm, palette)
+                // The large row icon is the call type, not the
+                // name initial (v1.4.1, issue #18): the type
+                // colour as the avatar tile, the same 0.32 bg
+                // and 0.92 fg blends the initials tiles use, so
+                // incoming, outgoing, missed, rejected and
+                // blocked each read at a glance. The small
+                // subtitle icon goes away with it (typeIcon -1,
+                // hasIcon false), so the type is shown once, not
+                // twice; the subtitle words stay as they were.
+                // People rows keep their initial avatars.
+                val typeTint = color(typeTintRes(r.type))
                 val display = RowDisplay(
                     title = VaultLogic.effectiveName(r),
                     subtitle = VaultLogic.callSubtitle(r.name, r.numberRaw, r.type),
                     rightTop = VaultLogic.formatTime(r.dateMs),
                     rightBottom = VaultLogic.callRightBottom(r.durationSec),
-                    avatarInitials = initials,
-                    avatarBg = bg,
-                    avatarFg = fg,
-                    typeIcon = r.type,
+                    avatarInitials = null,
+                    avatarBg = UiKit.blendOver(palette.card, typeTint, 0.32f),
+                    avatarFg = UiKit.blendOver(palette.card, typeTint, 0.92f),
+                    typeIcon = -1,
                     showDivider = divider,
                     numberNorm = r.numberNorm,
-                    hasIcon = r.type in RowView.ICON_TYPES
+                    hasIcon = false,
+                    avatarTypeIcon = r.type
                 )
                 rowLayoutFactory.buildInto(display, listWidthPx)
                 out.add(Item.Display(display))
@@ -3195,15 +3380,9 @@ class MainActivity : Activity() {
             return
         }
         if (items.isEmpty()) {
-            emptyView.text = when {
-                allRecords.isEmpty() ->
-                    "No calls saved yet.\nNew calls will be copied here automatically.\n\n" +
-                        "Backups live outside this app, in a folder you choose, " +
-                        "so clearing app data or uninstalling never deletes a backup file."
-                peopleMode -> "No people match this search."
-                query.isNotBlank() -> "Nothing matches this search."
-                else -> "Nothing in this view yet."
-            }
+            // One decision in VaultLogic (v1.4.1, issue #20), so
+            // the two pages can never drift apart again.
+            emptyView.text = VaultLogic.emptyListText(allRecords.isEmpty(), peopleMode, query)
             emptyView.visibility = View.VISIBLE
         } else {
             emptyView.visibility = View.GONE
@@ -3459,17 +3638,105 @@ class MainActivity : Activity() {
     }
 
     /**
-     * What's New (v1.4.0): written in the simplest language, covering
-     * everything since the last public release (v1.2.9), because the
-     * 1.3.x builds were never published. No em dashes, no jargon.
+     * What's New (v1.4.2): colour coded sections instead of a
+     * plain typed list. Three sections, each with a coloured dot
+     * and label plus dotted items, generous spacing, no cramped
+     * wall of text. The wording stays in the simplest language,
+     * no em dashes. The section colours are dedicated resources
+     * (whats_new_new / better / fixed) with verified text
+     * contrast of 4.5:1 or better on the light, dark and AMOLED
+     * dialog cards; the numbers are in V142 notes. The content
+     * covers everything since the last public release, v1.4.0:
+     * the v1.4.1 fixes, which were never published on their own,
+     * plus this version's changes.
      */
-    private val whatsNewText: String =
-        "• One call now reads 1 CALL, not 1 CALLS.\n" +
-        "• A person saved with and without a country code now shows as one person.\n" +
-        "• The side scroller now fades and shrinks away smoothly after you scroll, and grows back gently.\n" +
-        "• The pills now use calm solid colours with no glass look, and the scroller is easy to see on white screens.\n" +
-        "• New privacy options in the menu: you can hide call details like first call, last call, total calls and total talk time, and you can hide the whole People section.\n" +
-        "• This popup is new too. It appears once after each update, so you always know what changed."
+    private data class WhatsNewSection(val label: String, val colorRes: Int, val items: List<String>)
+
+    private val whatsNewSections: List<WhatsNewSection> = listOf(
+        WhatsNewSection("New", R.color.whats_new_new, listOf(
+            "People icons can now show how many calls each person made. Turn it on in the menu under Display, or keep the initial.",
+            "People has new filters: Unknown and Missed calls."
+        )),
+        WhatsNewSection("Better", R.color.whats_new_better, listOf(
+            "On Call Logs, each row shows a big icon for the type of call, and the second line now shows just the number.",
+            "The Unknown filter moved from Call Logs to People, where it now works.",
+            "Switching between Call Logs and People clears the search, and tapping outside the search box closes the keyboard.",
+            "An empty search now says No calls match this search on Call Logs."
+        )),
+        WhatsNewSection("Fixed", R.color.whats_new_fixed, listOf(
+            "If you save a number to your contacts later, old calls from that number now show the name too.",
+            "The side scroller now always disappears after you press the back to top button, and when you change pages.",
+            "Date lines no longer darken when you press and hold them."
+        ))
+    )
+
+    /** The What's New content: sections with breathing room. */
+    private fun buildWhatsNewContent(): View {
+        val body = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        for ((sectionIndex, section) in whatsNewSections.withIndex()) {
+            val labelRow = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+            }
+            labelRow.addView(View(this).apply {
+                background = GradientDrawable().apply {
+                    shape = GradientDrawable.OVAL
+                    setColor(color(section.colorRes))
+                }
+                layoutParams = LinearLayout.LayoutParams(dp(10), dp(10))
+            })
+            labelRow.addView(TextView(this).apply {
+                text = section.label.uppercase(Locale.ROOT)
+                textSize = 12f
+                setTypeface(typeface, Typeface.BOLD)
+                letterSpacing = 0.16f
+                setTextColor(color(section.colorRes))
+                layoutParams = LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.WRAP_CONTENT,
+                    LinearLayout.LayoutParams.WRAP_CONTENT
+                ).apply { marginStart = dp(8) }
+            })
+            body.addView(labelRow, LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply { topMargin = dp(if (sectionIndex == 0) 6 else 22) })
+            for (item in section.items) {
+                val row = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+                row.addView(View(this).apply {
+                    background = GradientDrawable().apply {
+                        shape = GradientDrawable.OVAL
+                        setColor(color(section.colorRes))
+                    }
+                    layoutParams = LinearLayout.LayoutParams(dp(8), dp(8)).apply {
+                        topMargin = dp(7)
+                    }
+                })
+                row.addView(TextView(this).apply {
+                    text = item
+                    textSize = 15f
+                    setTextColor(color(R.color.text))
+                    setLineSpacing(dp(3).toFloat(), 1f)
+                    layoutParams = LinearLayout.LayoutParams(
+                        0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f
+                    ).apply { marginStart = dp(12) }
+                })
+                body.addView(row, LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.MATCH_PARENT,
+                    LinearLayout.LayoutParams.WRAP_CONTENT
+                ).apply { topMargin = dp(12) })
+            }
+        }
+        // The list is long, so it scrolls inside the dialog like
+        // the Status cards do: capped at 55 percent of the display
+        // height, so the dialog can never run off the screen.
+        val scroll = ScrollView(this)
+        scroll.addView(body)
+        scroll.layoutParams = LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT,
+            (resources.displayMetrics.heightPixels * 0.55f).toInt()
+        )
+        return scroll
+    }
 
     /** Version code of the running build, 0 when it cannot be read. */
     private fun currentVersionCode(): Int = try {
@@ -3490,10 +3757,10 @@ class MainActivity : Activity() {
 
     /** The What's New popup itself, also reopened from the drawer. */
     private fun showWhatsNewDialog() {
-        VaultDialog.message(
+        VaultDialog.custom(
             this,
             "What's new in " + versionName(),
-            whatsNewText,
+            buildWhatsNewContent(),
             "Got it"
         )
     }

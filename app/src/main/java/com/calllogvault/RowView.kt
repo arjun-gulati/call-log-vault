@@ -49,6 +49,16 @@ data class RowDisplay(
     val numberNorm: String,
     val compact: Boolean = false,
     val hasIcon: Boolean = false,
+    // Large type icon for Call Logs rows (v1.4.1, issue #18):
+    // when >= 0 the left circle carries the call type icon
+    // instead of initials, on the avatarBg tint. -1 means the
+    // initials avatar (People page, unchanged).
+    val avatarTypeIcon: Int = -1,
+    // Call count for People rows (v1.4.2, issue #18 follow up):
+    // when >= 0 the left circle carries the count (see
+    // VaultLogic.personAvatarCountText) instead of the initial.
+    // -1 means no count (Call Logs rows, timeline rows).
+    val avatarCount: Int = -1,
     // Resolved tint color for the type icon, used by compact rows
     // to back the icon with a soft chip (v1.2.0). 0 means no chip.
     val typeTint: Int = 0
@@ -120,6 +130,13 @@ class RowView(context: Context) : View(context) {
         typeface = UiKit.mediumTypeface
         textAlign = Paint.Align.CENTER
     }
+    // People count paint (v1.4.2, issue #18 follow up): same
+    // medium face and centering as the initials, sized per row in
+    // onDraw through VaultLogic.personAvatarCountTextSizeSp.
+    private val countPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        typeface = UiKit.mediumTypeface
+        textAlign = Paint.Align.CENTER
+    }
     private val titlePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         typeface = UiKit.mediumTypeface
         color = textColor
@@ -133,6 +150,10 @@ class RowView(context: Context) : View(context) {
 
     private var item: RowDisplay? = null
     private var icons: Map<Int, Bitmap> = emptyMap()
+    // Large type icons for the Call Logs left circle (v1.4.1,
+    // issue #18), rendered once at avatar size, separate from
+    // the small subtitle icons above.
+    private var avatarIcons: Map<Int, Bitmap> = emptyMap()
     private var heightPx: Int = (ROW_HEIGHT_DP * dpF).toInt()
 
     /**
@@ -149,9 +170,14 @@ class RowView(context: Context) : View(context) {
         isClickable = false
     }
 
-    fun setItem(newItem: RowDisplay, newIcons: Map<Int, Bitmap>) {
+    fun setItem(
+        newItem: RowDisplay,
+        newIcons: Map<Int, Bitmap>,
+        newAvatarIcons: Map<Int, Bitmap> = emptyMap()
+    ) {
         item = newItem
         icons = newIcons
+        avatarIcons = newAvatarIcons
         titlePaint.textSize = sp(if (newItem.compact) 15f else 16f)
         subPaint.textSize = sp(13f)
         rightPaint.textSize = sp(if (newItem.compact) 13f else 12f)
@@ -223,6 +249,35 @@ class RowView(context: Context) : View(context) {
             initialsPaint.color = d.avatarFg
             val fm = initialsPaint.fontMetrics
             canvas.drawText(d.avatarInitials, cx, cy - (fm.ascent + fm.descent) / 2f, initialsPaint)
+        } else if (d.avatarCount >= 0) {
+            // People page count icon (v1.4.2, issue #18 follow
+            // up): the same 48dp circle the initials used, with
+            // the call count centred on it in the tile
+            // foreground. Same geometry, so the row height and
+            // text positions do not move.
+            val cx = dp(44f)
+            avatarPaint.color = d.avatarBg
+            canvas.drawCircle(cx, cy, dp(24f), avatarPaint)
+            countPaint.color = d.avatarFg
+            countPaint.textSize = sp(VaultLogic.personAvatarCountTextSizeSp(d.avatarCount))
+            val fm = countPaint.fontMetrics
+            canvas.drawText(
+                VaultLogic.personAvatarCountText(d.avatarCount),
+                cx, cy - (fm.ascent + fm.descent) / 2f, countPaint
+            )
+        } else if (d.avatarTypeIcon >= 0) {
+            // Call Logs large type icon (v1.4.1, issue #18): the
+            // same 48dp circle the initials used, tinted for the
+            // call type, with the type icon centred on it. Same
+            // geometry as the initials avatar, so the row height
+            // and text positions do not move.
+            val cx = dp(44f)
+            avatarPaint.color = d.avatarBg
+            canvas.drawCircle(cx, cy, dp(24f), avatarPaint)
+            val bmp = avatarIcons[d.avatarTypeIcon]
+            if (bmp != null) {
+                canvas.drawBitmap(bmp, cx - bmp.width / 2f, cy - bmp.height / 2f, null)
+            }
         }
 
         // Middle: title over subtitle, the pair centered as one block,
@@ -231,7 +286,10 @@ class RowView(context: Context) : View(context) {
         val titleFm = titlePaint.fontMetrics
         val subFm = subPaint.fontMetrics
         val titleLineH = titleFm.descent - titleFm.ascent
-        val subLineH = subFm.descent - subFm.ascent
+        // An empty subtitle carries no second line (unknown Call
+        // Logs rows since v1.4.2): the block is the title alone,
+        // centred, instead of a title pushed up by a phantom line.
+        val subLineH = if (d.subtitle.isEmpty()) 0f else subFm.descent - subFm.ascent
         val gap = dp(2f)
         val blockTop = cy - (titleLineH + gap + subLineH) / 2f
         val titleLayout = d.titleLayout

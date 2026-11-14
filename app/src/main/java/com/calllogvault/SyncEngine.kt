@@ -4,6 +4,7 @@ import android.content.ContentProviderOperation
 import android.content.ContentUris
 import android.content.ContentValues
 import android.content.Context
+import android.database.sqlite.SQLiteDatabase
 import android.net.Uri
 import android.provider.CallLog
 import android.provider.ContactsContract
@@ -15,7 +16,15 @@ import android.provider.ContactsContract
  */
 object SyncEngine {
 
-    data class SyncResult(val added: Int, val skipped: Int, val seen: Int, val error: String? = null)
+    data class SyncResult(
+        val added: Int,
+        val skipped: Int,
+        val seen: Int,
+        val error: String? = null,
+        // Stored rows renamed by the contact re-resolve (v1.4.1,
+        // issue #15): old entries picking up a newly saved name.
+        val namesUpdated: Int = 0
+    )
     data class RestoreResult(val inserted: Int, val skipped: Int, val error: String? = null)
 
     private const val PREFS = "vault_prefs"
@@ -89,6 +98,35 @@ object SyncEngine {
     }
 
     /**
+     * Re-resolve stored unknown names against the current contacts
+     * (v1.4.1, issue #15). Lookups reuse the run's name cache, so
+     * a number the insert scan already looked up costs nothing
+     * again. Returns the number of stored rows renamed; a failed
+     * rename never sinks the sync that just ran.
+     */
+    private fun refreshStoredNames(
+        context: Context,
+        helper: VaultDb,
+        db: SQLiteDatabase,
+        nameCache: HashMap<String, String>
+    ): Int {
+        var updated = 0
+        try {
+            for ((norm, _) in helper.unknownNumbers(db)) {
+                if (norm.isBlank()) continue
+                val looked = nameCache[norm] ?: lookupContactName(context, norm)
+                    .also { nameCache[norm] = it }
+                if (looked.isNotBlank()) {
+                    updated += helper.updateNamesForNumber(db, norm, looked)
+                }
+            }
+        } catch (e: Exception) {
+            // A failed rename never sinks the sync that just ran.
+        }
+        return updated
+    }
+
+    /**
      * Copy new system call log entries into the vault, and persist the
      * outcome (error text, empty on success) for the Status diagnostics.
      */
@@ -148,6 +186,11 @@ object SyncEngine {
                     CallLog.Calls.CONTENT_URI, CALL_PROJECTION_FALLBACK, selection, args, sortOrder
                 )
             }
+            // Contact lookups are cached per normalized number for
+            // the duration of this run (see the insert scan and the
+            // name refresh below), so a 2000 row first import does
+            // at most one PhoneLookup per distinct unknown number.
+            val nameCache = HashMap<String, String>()
             cursor?.use { c ->
                 val iId = c.getColumnIndex(CallLog.Calls._ID)
                 val iNumber = c.getColumnIndex(CallLog.Calls.NUMBER)
@@ -167,11 +210,7 @@ object SyncEngine {
                 // even while it still sits in the phone's own log.
                 val tombstones = helper.tombstoneHashes(db)
                 // Speed: one transaction wraps every insert below (VaultDb
-                // uses insertWithOnConflict with CONFLICT_IGNORE), and
-                // contact lookups are cached per normalized number for the
-                // duration of this run, so a 2000 row first import does at
-                // most one PhoneLookup per distinct unknown number.
-                val nameCache = HashMap<String, String>()
+                // uses insertWithOnConflict with CONFLICT_IGNORE).
                 db.beginTransaction()
                 try {
                     while (c.moveToNext()) {
@@ -213,6 +252,18 @@ object SyncEngine {
                     db.endTransaction()
                 }
             }
+            // Contact rename (v1.4.1, issue #15): a number saved to
+            // contacts after its calls were imported keeps showing
+            // as unknown until something re-resolves it, so the
+            // same number appears twice, once named and once
+            // unknown. Every sync re-checks the numbers whose
+            // stored name is still unknown against the current
+            // contacts and renames their stored rows, so old
+            // entries pick up the newly saved name. Name only: no
+            // call is merged, deleted or re-dated, and the pause
+            // gate above already kept this whole run from
+            // happening while a pause is in force.
+            val namesUpdated = refreshStoredNames(context, helper, db, nameCache)
             context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
                 .putLong(KEY_LAST_SYNC_MS, System.currentTimeMillis())
                 .putInt(KEY_LAST_SYNC_ADDED, added)
@@ -222,7 +273,7 @@ object SyncEngine {
             // the v1.0.3 infinite Sync spinner. Callers that learn new
             // calls were added accumulate them in AutoBackup and
             // schedule the separate AutoBackupJobService instead.
-            return SyncResult(added, skipped, seen)
+            return SyncResult(added, skipped, seen, namesUpdated = namesUpdated)
         } catch (e: SecurityException) {
             return SyncResult(added, skipped, seen, "Call log permission not granted")
         } catch (e: Exception) {
