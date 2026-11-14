@@ -144,6 +144,41 @@ class VaultDb(context: Context) : SQLiteOpenHelper(context, "vault.db", null, 3)
     }
 
     /**
+     * Every distinct normalized number whose stored rows still
+     * carry an unknown name (v1.4.1, issue #15): the numbers a
+     * later saved contact can rename. One pair per number, with
+     * a representative raw form for display.
+     */
+    fun unknownNumbers(db: SQLiteDatabase): List<Pair<String, String>> {
+        val out = ArrayList<Pair<String, String>>()
+        db.rawQuery(
+            "SELECT DISTINCT number_norm, number_raw FROM calls WHERE $UNKNOWN_NAME_WHERE",
+            null
+        ).use { c ->
+            while (c.moveToNext()) {
+                out.add(Pair(c.getString(0) ?: "", c.getString(1) ?: ""))
+            }
+        }
+        return out
+    }
+
+    /**
+     * Rename every stored row of one normalized number whose
+     * name is still unknown (v1.4.1, issue #15). Only the name
+     * changes: no call is merged, deleted or re-dated, and rows
+     * that already carry a real name are never touched. Returns
+     * the number of rows renamed.
+     */
+    fun updateNamesForNumber(db: SQLiteDatabase, numberNorm: String, name: String): Int {
+        val cv = ContentValues()
+        cv.put("name_cached", name)
+        return db.update(
+            "calls", cv, "number_norm = ? AND $UNKNOWN_NAME_WHERE",
+            arrayOf(numberNorm)
+        )
+    }
+
+    /**
      * Column positions for one cursor, resolved once per query.
      * Before v1.0.6 readRow called getColumnIndexOrThrow (a name
      * lookup over the cursor's column list) eight times for EVERY
@@ -466,6 +501,17 @@ class VaultDb(context: Context) : SQLiteOpenHelper(context, "vault.db", null, 3)
     }
 
     companion object {
+        /**
+         * The stored name counts as unknown exactly when
+         * VaultLogic.isUnknownName says so: empty, "(Unknown)"
+         * or "Unknown". The predicate mirrors that rule in SQL,
+         * so the two can never disagree about which rows a name
+         * refresh may touch.
+         */
+        private const val UNKNOWN_NAME_WHERE =
+            "(name_cached IS NULL OR TRIM(name_cached) = '' " +
+                "OR name_cached = '(Unknown)' OR name_cached = 'Unknown')"
+
         private const val CREATE_TOMBSTONES =
             "CREATE TABLE IF NOT EXISTS tombstones (" +
                 "key_hash TEXT PRIMARY KEY, " +

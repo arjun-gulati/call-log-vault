@@ -56,6 +56,7 @@ object UiKit {
     private const val KEY_AMOLED_FOR_DARK = "amoled_for_dark"
     private const val KEY_SHOW_CALL_DETAILS = "show_call_details"
     private const val KEY_SHOW_PEOPLE_MENU = "show_people_menu"
+    private const val KEY_SHOW_PEOPLE_COUNT = "show_people_count"
     private const val KEY_WHATS_NEW_SHOWN = "whats_new_shown_version"
 
     /** Read only by the one time migration; never written anymore. */
@@ -177,6 +178,21 @@ object UiKit {
     fun setShowPeopleMenu(context: Context, value: Boolean) {
         context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
             .putBoolean(KEY_SHOW_PEOPLE_MENU, value)
+            .apply()
+    }
+
+    /**
+     * People icon toggle (v1.4.2): the call count on the People
+     * icons. Default OFF, so People icons show the initial as
+     * before; turning it on switches them to the call count.
+     */
+    fun showPeopleCount(context: Context): Boolean =
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            .getBoolean(KEY_SHOW_PEOPLE_COUNT, false)
+
+    fun setShowPeopleCount(context: Context, value: Boolean) {
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
+            .putBoolean(KEY_SHOW_PEOPLE_COUNT, value)
             .apply()
     }
 

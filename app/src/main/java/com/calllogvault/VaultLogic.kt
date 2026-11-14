@@ -43,10 +43,30 @@ object VaultLogic {
         val displayName: String,
         val callCount: Int,
         val totalDurationSec: Long,
-        val lastDateMs: Long
+        val lastDateMs: Long,
+        // People filters (v1.4.2, issue #18 follow up): whether any
+        // of the person's calls carries a saved contact name, and
+        // whether any of them was missed. Computed in groupPeople
+        // from the records themselves, so no new tracking exists.
+        val hasSavedName: Boolean,
+        val hasMissed: Boolean
     )
 
     enum class Filter { ALL, INCOMING, OUTGOING, MISSED, REJECTED, BLOCKED, UNKNOWN }
+
+    /**
+     * Filters for the People page (v1.4.2, issue #18 follow up).
+     * The Call Logs chips never applied here (the page hid the chip
+     * row entirely); these are the page's own filters, over the
+     * grouped summaries, not over single calls.
+     */
+    enum class PersonFilter { ALL, UNKNOWN, MISSED }
+
+    fun matchesPersonFilter(p: PersonSummary, filter: PersonFilter): Boolean = when (filter) {
+        PersonFilter.ALL -> true
+        PersonFilter.UNKNOWN -> !p.hasSavedName
+        PersonFilter.MISSED -> p.hasMissed
+    }
 
     /** Strip separators, keep digits and a single leading plus sign. */
     fun normalizeNumber(raw: String): String {
@@ -190,7 +210,9 @@ object VaultLogic {
                     displayName = named?.name?.trim() ?: latest.numberRaw,
                     callCount = list.size,
                     totalDurationSec = list.sumOf { it.durationSec },
-                    lastDateMs = latest.dateMs
+                    lastDateMs = latest.dateMs,
+                    hasSavedName = named != null,
+                    hasMissed = list.any { it.type == TYPE_MISSED }
                 )
             )
         }
@@ -894,30 +916,111 @@ object VaultLogic {
     // functions reproduce the exact strings the old view based rows built
     // per bind in v1.0.2.
 
-    /** Subtitle of a call row: the number plus the type, or just the type for unknown names. */
+    /**
+     * Subtitle of a call row (v1.4.2, issue #18 follow up): the
+     * number only. The type word is gone because the big type icon
+     * (v1.4.1) already shows it; repeating it in words was the
+     * duplication the reporter asked to drop. An unknown row has
+     * no second line left: its title already is the number, and
+     * the date and time live in the right column, so the subtitle
+     * is empty and the row draws the title alone, centred (see
+     * RowView). [type] stays in the signature so callers do not
+     * churn; it no longer contributes a word.
+     */
     fun callSubtitle(name: String, numberRaw: String, type: Int): String =
-        if (isUnknownName(name)) typeLabel(type)
-        else numberRaw + "  ·  " + typeLabel(type)
+        if (isUnknownName(name)) "" else numberRaw
 
     /** Bottom right text of a call row: the duration, empty when the call had none. */
     fun callRightBottom(durationSec: Long): String =
         if (durationSec > 0) formatDuration(durationSec) else ""
 
-    /** Subtitle of a person row: number, call count and total talk time. */
-    fun personSubtitle(numberRaw: String, callCount: Int, totalDurationSec: Long): String =
-        numberRaw + "  ·  " + callCount + " calls  ·  " + formatDuration(totalDurationSec) + " total"
+    /**
+     * Subtitle of a person row (v1.4.2, issue #18 follow up):
+     * number and total talk time. The call count moved onto the
+     * row icon, so the second line drops it instead of repeating
+     * it; the count is still shown, once, in the circle.
+     */
+    fun personSubtitle(numberRaw: String, totalDurationSec: Long): String =
+        numberRaw + "  ·  " + formatDuration(totalDurationSec) + " total"
 
     /**
      * Person row subtitle under the privacy toggle (v1.4.0): with
      * stats on it is the full subtitle; with stats off it is just
      * the number, so no count or talk time leaks into the list.
      */
-    fun personRowSubtitle(numberRaw: String, callCount: Int, totalDurationSec: Long, showStats: Boolean): String =
-        if (showStats) personSubtitle(numberRaw, callCount, totalDurationSec) else numberRaw
+    fun personRowSubtitle(numberRaw: String, totalDurationSec: Long, showStats: Boolean): String =
+        if (showStats) personSubtitle(numberRaw, totalDurationSec) else numberRaw
+
+    /**
+     * What the People icon shows (v1.4.2, issue #18 follow up):
+     * the call count as plain digits, sized so three digits still
+     * fit the 48dp circle and four or more shrink a step. The
+     * initial is gone from the icon: it only repeated the title
+     * text next to the row, and two stacked lines in a 48dp
+     * circle read as clutter.
+     */
+    fun personAvatarCountText(callCount: Int): String = callCount.toString()
+
+    fun personAvatarCountTextSizeSp(callCount: Int): Float = when {
+        callCount < 100 -> 18f
+        callCount < 1000 -> 15f
+        else -> 12f
+    }
+
+    /**
+     * Which content a People icon carries (v1.4.2): the call count
+     * when the toggle is on, the initial when it is off. The two
+     * are never shown together; the row builder takes the count
+     * from [peopleAvatarCount] and the initial from
+     * [peopleAvatarInitials], and exactly one of them is set.
+     */
+    fun peopleAvatarCount(callCount: Int, showCount: Boolean): Int =
+        if (showCount) callCount else -1
+
+    fun peopleAvatarInitials(initials: String, showCount: Boolean): String? =
+        if (showCount) null else initials
 
     /** People mode only counts when the People menu itself is on (v1.4.0). */
     fun effectivePeopleMode(requestedPeople: Boolean, showPeopleMenu: Boolean): Boolean =
         requestedPeople && showPeopleMenu
+
+    /**
+     * Search is per page, not shared (v1.4.1, issue #19): a real
+     * page switch clears the query, so Call Logs never inherits a
+     * People search and back. Asking for the page already on
+     * screen is not a switch and keeps the query.
+     */
+    fun shouldClearSearchOnPageSwitch(switching: Boolean): Boolean = switching
+
+    /**
+     * The empty list text (v1.4.1, issue #20): one decision in
+     * one place, so the two pages can never drift apart again.
+     * Both search misses name their page the same way: "No calls
+     * match this search." on Call Logs, "No people match this
+     * search." on People.
+     */
+    fun emptyListText(allRecordsEmpty: Boolean, peopleMode: Boolean, query: String): String =
+        when {
+            allRecordsEmpty ->
+                "No calls saved yet.\nNew calls will be copied here automatically.\n\n" +
+                    "Backups live outside this app, in a folder you choose, " +
+                    "so clearing app data or uninstalling never deletes a backup file."
+            peopleMode -> "No people match this search."
+            query.isNotBlank() -> "No calls match this search."
+            else -> "Nothing in this view yet."
+        }
+
+    /**
+     * The idle hide may only be armed when the list is genuinely
+     * at rest (v1.4.1, issue #16): no drag in flight, no scroll
+     * in flight, and a list that can show the pill at all. The
+     * go to top arrival and the page switch restore arm it
+     * through this rule, because neither of those settles the
+     * list through a scroll state change, so the IDLE arm alone
+     * strands the pill visible.
+     */
+    fun shouldArmScrubFade(scrubbing: Boolean, scrubScrolling: Boolean, scrubberAvailable: Boolean): Boolean =
+        !scrubbing && !scrubScrolling && scrubberAvailable
 
     /**
      * The What's New popup fires once per version: whenever the
