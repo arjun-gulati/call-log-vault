@@ -72,6 +72,8 @@ fun main() {
     testScrubberIdleShow()
     testGroupingNumberVariants()
     testPrivacyWhatsNew()
+    testIssues15to21()
+    testIssue18FollowUp()
     println("CHECKS=$checks FAILURES=$failures")
     println(if (failures == 0) "ALL_VAULT_TESTS_PASSED" else "VAULT_TEST_FAILURES=$failures")
     if (failures > 0) kotlin.system.exitProcess(1)
@@ -716,17 +718,17 @@ fun testRowDisplayStrings() {
     println("== row display strings (v1.0.3 precomputed row content) ==")
     val t1 = 1700000000000L // 14 Nov 2023, 22:13:20 UTC
     val dayMs = 24L * 3600 * 1000
-    check("call subtitle with name",
-        VaultLogic.callSubtitle("Asha", "+919000000010", VaultLogic.TYPE_INCOMING) == "+919000000010  ·  Incoming")
-    check("call subtitle unknown name is type only",
-        VaultLogic.callSubtitle("", "+919000000010", VaultLogic.TYPE_MISSED) == "Missed")
-    check("call subtitle (Unknown) name is type only",
-        VaultLogic.callSubtitle("(Unknown)", "12345", VaultLogic.TYPE_OUTGOING) == "Outgoing")
+    check("call subtitle with name is the number only",
+        VaultLogic.callSubtitle("Asha", "+919000000010", VaultLogic.TYPE_INCOMING) == "+919000000010")
+    check("call subtitle unknown name is empty, the title already is the number",
+        VaultLogic.callSubtitle("", "+919000000010", VaultLogic.TYPE_MISSED) == "")
+    check("call subtitle (Unknown) name is empty",
+        VaultLogic.callSubtitle("(Unknown)", "12345", VaultLogic.TYPE_OUTGOING) == "")
     check("call right bottom with duration",
         VaultLogic.callRightBottom(65) == "1m 05s")
     check("call right bottom zero is empty", VaultLogic.callRightBottom(0) == "")
-    check("person subtitle",
-        VaultLogic.personSubtitle("+919000000010", 3, 125) == "+919000000010  ·  3 calls  ·  2m 05s total")
+    check("person subtitle drops the count, the icon carries it",
+        VaultLogic.personSubtitle("+919000000010", 125) == "+919000000010  ·  2m 05s total")
     check("person right top today",
         VaultLogic.personRightTop(t1, t1 + 3600_000) == "Today")
     check("person right top yesterday",
@@ -1237,6 +1239,42 @@ fun testPause() {
     check("merge open pause: the earlier call still imports", openPlan.inserts.any { it.dateMs == t0 - hour })
 }
 
+fun testIssues15to21() {
+    println("== issues 15 to 21 (v1.4.1) ==")
+    // #20: both empty search misses name their page the same way.
+    check("empty text call log search miss names calls",
+        VaultLogic.emptyListText(false, false, "zzz") == "No calls match this search.")
+    check("empty text people search miss names people",
+        VaultLogic.emptyListText(false, true, "zzz") == "No people match this search.")
+    check("empty text call log without query is the plain empty line",
+        VaultLogic.emptyListText(false, false, "") == "Nothing in this view yet.")
+    check("empty text people without query still names people",
+        VaultLogic.emptyListText(false, true, "") == "No people match this search.")
+    check("empty text vault empty is the first run text",
+        VaultLogic.emptyListText(true, false, "").startsWith("No calls saved yet."))
+    check("empty text vault empty wins over people mode",
+        VaultLogic.emptyListText(true, true, "zzz").startsWith("No calls saved yet."))
+    // #16: the idle hide arms only when the list is at rest.
+    check("scrub fade arms when idle and available",
+        VaultLogic.shouldArmScrubFade(false, false, true))
+    check("scrub fade never arms while dragging",
+        !VaultLogic.shouldArmScrubFade(true, false, true))
+    check("scrub fade never arms while scrolling",
+        !VaultLogic.shouldArmScrubFade(false, true, true))
+    check("scrub fade never arms when the pill cannot show",
+        !VaultLogic.shouldArmScrubFade(false, false, false))
+    // #19: search clears on a real page switch and only then.
+    check("search clears on page switch",
+        VaultLogic.shouldClearSearchOnPageSwitch(true))
+    check("search keeps on same page request",
+        !VaultLogic.shouldClearSearchOnPageSwitch(false))
+    // #15: the unknown name rule the rename predicate mirrors.
+    check("unknown name rule covers blank and Unknown forms",
+        VaultLogic.isUnknownName("") && VaultLogic.isUnknownName("(Unknown)") &&
+            VaultLogic.isUnknownName("Unknown") && VaultLogic.isUnknownName("  ") &&
+            !VaultLogic.isUnknownName("Asha"))
+}
+
 fun testSolidBar() {
     println("== solid File Master bar fills and strokes (v1.3.3) ==")
     val light = VaultLogic.APPEARANCE_LIGHT
@@ -1264,16 +1302,64 @@ fun testSolidBar() {
 fun testPrivacyWhatsNew() {
     println("== privacy toggles and whats new (v1.4.0) ==")
     check("person subtitle with stats on is the full subtitle",
-        VaultLogic.personRowSubtitle("+919000000010", 3, 125, true) ==
-            "+919000000010  ·  3 calls  ·  2m 05s total")
+        VaultLogic.personRowSubtitle("+919000000010", 125, true) ==
+            "+919000000010  ·  2m 05s total")
     check("person subtitle with stats off is just the number",
-        VaultLogic.personRowSubtitle("+919000000010", 3, 125, false) == "+919000000010")
+        VaultLogic.personRowSubtitle("+919000000010", 125, false) == "+919000000010")
     check("person subtitle with stats off hides zero stats too",
-        VaultLogic.personRowSubtitle("+919000000010", 0, 0, false) == "+919000000010")
+        VaultLogic.personRowSubtitle("+919000000010", 0, false) == "+919000000010")
     check("people mode allowed when menu on", VaultLogic.effectivePeopleMode(true, true))
     check("people mode blocked when menu off", !VaultLogic.effectivePeopleMode(true, false))
     check("call log mode unaffected by menu off", !VaultLogic.effectivePeopleMode(false, false))
     check("whats new shows on first install", VaultLogic.shouldShowWhatsNew(0, 26))
     check("whats new shows after upgrade", VaultLogic.shouldShowWhatsNew(21, 26))
     check("whats new hidden once shown for this version", !VaultLogic.shouldShowWhatsNew(26, 26))
+}
+
+fun testIssue18FollowUp() {
+    println("== issue 18 follow up: people filters and icons (v1.4.2) ==")
+    val t1 = 1700000000000L
+    // People filters over grouped summaries.
+    val named = VaultLogic.PersonSummary("+919000000010", "+919000000010", "Asha", 5, 300, t1, true, true)
+    val unknown = VaultLogic.PersonSummary("+919000000011", "+919000000011", "+919000000011", 2, 0, t1, false, false)
+    val noMissed = VaultLogic.PersonSummary("+919000000012", "+919000000012", "Ravi", 1, 60, t1, true, false)
+    check("person filter all keeps everyone",
+        VaultLogic.matchesPersonFilter(named, VaultLogic.PersonFilter.ALL) &&
+            VaultLogic.matchesPersonFilter(unknown, VaultLogic.PersonFilter.ALL))
+    check("person filter unknown keeps only unsaved contacts",
+        !VaultLogic.matchesPersonFilter(named, VaultLogic.PersonFilter.UNKNOWN) &&
+            VaultLogic.matchesPersonFilter(unknown, VaultLogic.PersonFilter.UNKNOWN))
+    check("person filter missed keeps only people with a missed call",
+        VaultLogic.matchesPersonFilter(named, VaultLogic.PersonFilter.MISSED) &&
+            !VaultLogic.matchesPersonFilter(noMissed, VaultLogic.PersonFilter.MISSED) &&
+            !VaultLogic.matchesPersonFilter(unknown, VaultLogic.PersonFilter.MISSED))
+    // groupPeople carries the filter facts: a named group with a
+    // missed call, and an unknown group with no missed call.
+    val grouped = VaultLogic.groupPeople(listOf(
+        rec(number = "+919000000010", name = "Asha", date = t1, type = VaultLogic.TYPE_MISSED),
+        rec(number = "+919000000010", name = "Asha", date = t1 - 1000, type = VaultLogic.TYPE_INCOMING),
+        rec(number = "+919000000011", name = "", date = t1, type = VaultLogic.TYPE_OUTGOING)
+    ))
+    check("grouped people are two", grouped.size == 2)
+    val asha = grouped.first { it.displayName == "Asha" }
+    check("grouped named person has a saved name and a missed call",
+        asha.hasSavedName && asha.hasMissed && asha.callCount == 2)
+    val stranger = grouped.first { it.displayName == "+919000000011" }
+    check("grouped unknown person has no saved name and no missed call",
+        !stranger.hasSavedName && !stranger.hasMissed)
+    // People icon content: the count when the toggle is on, the
+    // initial when it is off (the default). Never both.
+    check("icon shows count when toggle on",
+        VaultLogic.peopleAvatarCount(12, true) == 12 &&
+            VaultLogic.peopleAvatarInitials("A", true) == null)
+    check("icon shows initial when toggle off",
+        VaultLogic.peopleAvatarCount(12, false) == -1 &&
+            VaultLogic.peopleAvatarInitials("A", false) == "A")
+    check("icon count text is the plain digits",
+        VaultLogic.personAvatarCountText(7) == "7" &&
+            VaultLogic.personAvatarCountText(128) == "128")
+    check("icon count text shrinks with more digits",
+        VaultLogic.personAvatarCountTextSizeSp(9) == 18f &&
+            VaultLogic.personAvatarCountTextSizeSp(128) == 15f &&
+            VaultLogic.personAvatarCountTextSizeSp(1234) == 12f)
 }
